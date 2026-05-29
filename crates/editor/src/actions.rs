@@ -909,7 +909,7 @@ actions!(
         SubmitDiffReviewComment,
         /// Toggles the expanded state of the comments section in the overlay.
         ToggleReviewCommentsExpanded,
-        /// Sends all stored review comments to the Agent panel.
+        /// Copies stored review comments as JSON for an agent.
         SendReviewToAgent,
         /// Toggles the selection menu.
         ToggleSelectionMenu,

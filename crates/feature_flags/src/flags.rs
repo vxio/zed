@@ -33,6 +33,10 @@ impl FeatureFlag for DiffReviewFeatureFlag {
     const NAME: &'static str = "diff-review";
     type Value = PresenceFlag;
 
+    fn enabled_for_all() -> bool {
+        true
+    }
+
     fn enabled_for_staff() -> bool {
         false
     }

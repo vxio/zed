@@ -166,10 +166,11 @@ impl ThreadSafeConnection {
         Connection::open_memory(Some(uri))
     }
 
-    pub fn write<T: 'static + Send + Sync>(
-        &self,
-        callback: impl 'static + Send + FnOnce(&Connection) -> T,
-    ) -> impl Future<Output = T> {
+    pub fn write<T, C>(&self, callback: C) -> impl Future<Output = T> + use<T, C>
+    where
+        T: 'static + Send + Sync,
+        C: 'static + Send + FnOnce(&Connection) -> T,
+    {
         // Check and invalidate queue and maybe recreate queue
         let queues = QUEUES.read();
         let write_channel = queues

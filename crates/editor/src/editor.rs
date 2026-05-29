@@ -12054,10 +12054,9 @@ impl Deref for EditorSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditorEvent {
-    /// Emitted when the stored review comments change (added, removed, or updated).
     ReviewCommentsChanged {
-        /// The new total count of review comments.
         total_count: usize,
+        persist: bool,
     },
     InputIgnored {
         text: Arc<str>,
