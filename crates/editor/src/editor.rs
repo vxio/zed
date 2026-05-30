@@ -1141,9 +1141,13 @@ pub struct Editor {
     /// Uses a Vec instead of HashMap because DiffHunkKey contains an Anchor
     /// which doesn't implement Hash/Eq in a way suitable for HashMap keys.
     stored_review_comments: Vec<(DiffHunkKey, Vec<StoredReviewComment>)>,
+    orphaned_review_comments: Vec<git::ReviewCommentSnapshot>,
+    diff_review_editor_cancel: Option<git::DiffReviewEditorCancel>,
     /// Counter for generating unique comment IDs.
     next_review_comment_id: usize,
+    next_review_reply_id: usize,
     hovered_diff_hunk_row: Option<DisplayRow>,
+    hovered_diff_review_row: Option<DisplayRow>,
     pull_diagnostics_task: Task<()>,
     in_project_search: bool,
     previous_search_ranges: Option<Arc<[Range<Anchor>]>>,
@@ -2456,8 +2460,12 @@ impl Editor {
             diff_review_drag_state: None,
             diff_review_overlays: Vec::new(),
             stored_review_comments: Vec::new(),
+            orphaned_review_comments: Vec::new(),
+            diff_review_editor_cancel: None,
             next_review_comment_id: 0,
+            next_review_reply_id: 0,
             hovered_diff_hunk_row: None,
+            hovered_diff_review_row: None,
             _subscriptions: (!is_minimap)
                 .then(|| {
                     vec![
@@ -3461,6 +3469,15 @@ impl Editor {
     pub fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
         self.selection_mark_mode = false;
         self.selection_drag_state = SelectionDragState::None;
+
+        if let Some(cancel) = self.diff_review_editor_cancel.clone() {
+            cancel.cancel(window, cx);
+            return;
+        }
+
+        if self.cancel_active_diff_review_editor(window, cx) {
+            return;
+        }
 
         if self.dismiss_menus_and_popups(true, window, cx) {
             cx.notify();
@@ -9824,9 +9841,6 @@ impl Editor {
                 if source.is_local() && self.has_active_edit_prediction() {
                     self.update_visible_edit_prediction(window, cx);
                 }
-
-                // Clean up orphaned review comments after edits
-                self.cleanup_orphaned_review_comments(cx);
 
                 if let Some(buffer) = edited_buffer {
                     if buffer.read(cx).file().is_none() {

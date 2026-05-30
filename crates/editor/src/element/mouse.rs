@@ -119,6 +119,20 @@ impl EditorElement {
                 cx,
             );
 
+        let hovered_diff_review_row = if show_diff_review
+            && (gutter_hovered || text_hovered)
+            && hovered_diff_hunk_row.is_some()
+        {
+            Some(valid_point.row())
+        } else {
+            None
+        };
+
+        if hovered_diff_review_row != editor.hovered_diff_review_row {
+            editor.hovered_diff_review_row = hovered_diff_review_row;
+            cx.notify();
+        }
+
         let diff_review_indicator = if gutter_hovered && show_diff_review {
             let is_visible = editor
                 .gutter_diff_review_indicator

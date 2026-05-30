@@ -41728,64 +41728,120 @@ fn test_diff_review_inline_edit_flow(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn test_orphaned_comments_are_cleaned_up(cx: &mut TestAppContext) {
+fn test_diff_review_inline_edit_cancel_keeps_comment(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
-    // Create an editor with some text
-    let editor = cx.add_window(|window, cx| {
-        let buffer = cx.new(|cx| Buffer::local("line 1\nline 2\nline 3\n", cx));
-        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
-        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+    let cx = &mut VisualTestContext::from_window(*editor, cx);
+
+    let inline_editor = editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            let prompt_editor = editor.diff_review_prompt_editor().cloned().unwrap();
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.insert("Original comment", window, cx);
+            });
+            editor.submit_diff_review_comment(window, cx);
+            editor.edit_review_comment(&crate::actions::EditReviewComment { id: 0 }, window, cx);
+
+            assert_eq!(editor.total_review_comment_count(), 1);
+            let overlay = editor.diff_review_overlays.first().expect("review overlay");
+            assert_eq!(overlay.inline_edit_editors.len(), 1);
+            overlay
+                .inline_edit_editors
+                .get(&0)
+                .cloned()
+                .expect("inline edit editor")
+        })
+        .unwrap();
+
+    inline_editor.update_in(cx, |inline_editor, window, cx| {
+        inline_editor.cancel(&crate::actions::Cancel, window, cx);
     });
 
-    // Add a comment with an anchor on line 2
     editor
         .update(cx, |editor, _window, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
-            let anchor = snapshot.anchor_after(Point::new(1, 0)); // Line 2
-            let key = DiffHunkKey {
-                file_path: Arc::from(util::rel_path::RelPath::empty()),
-                hunk_start_anchor: anchor,
-            };
-            editor.add_review_comment(key, "Comment on line 2".to_string(), anchor..anchor, cx);
-            assert_eq!(editor.total_review_comment_count(), 1);
-        })
-        .unwrap();
-
-    // Delete all content (this should orphan the comment's anchor)
-    editor
-        .update(cx, |editor, window, cx| {
-            editor.select_all(&SelectAll, window, cx);
-            editor.insert("completely new content", window, cx);
-        })
-        .unwrap();
-
-    // Trigger cleanup
-    editor
-        .update(cx, |editor, _window, cx| {
-            editor.cleanup_orphaned_review_comments(cx);
-            // Comment should be removed because its anchor is invalid
-            assert_eq!(editor.total_review_comment_count(), 0);
+            let overlay = editor.diff_review_overlays.first().expect("review overlay");
+            let comments = editor.comments_for_hunk(&overlay.hunk_key, &snapshot);
+            assert_eq!(comments.len(), 1);
+            let comment = comments.first().expect("review comment");
+            assert_eq!(comment.comment, "Original comment");
+            assert!(!comment.is_editing);
+            assert!(overlay.inline_edit_editors.is_empty());
         })
         .unwrap();
 }
 
 #[gpui::test]
-fn test_orphaned_comments_cleanup_called_on_buffer_edit(cx: &mut TestAppContext) {
+fn test_diff_review_reply_flow_persists(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
-    // Create an editor with some text
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            let prompt_editor = editor.diff_review_prompt_editor().cloned().unwrap();
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.insert("Original comment", window, cx);
+            });
+            editor.submit_diff_review_comment(window, cx);
+            editor.reply_to_review_comment(
+                &crate::actions::ReplyToReviewComment { id: 0 },
+                window,
+                cx,
+            );
+
+            let overlay = editor.diff_review_overlays.first().expect("review overlay");
+            let reply_editor = overlay
+                .reply_editors
+                .get(&0)
+                .cloned()
+                .expect("reply editor");
+            reply_editor.update(cx, |reply_editor, cx| {
+                reply_editor.insert("Reply text", window, cx);
+            });
+            editor.submit_review_reply(0, window, cx);
+
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let overlay = editor.diff_review_overlays.first().expect("review overlay");
+            let comments = editor.comments_for_hunk(&overlay.hunk_key, &snapshot);
+            let comment = comments.first().expect("review comment");
+            assert_eq!(comment.replies.len(), 1);
+            assert_eq!(
+                comment.replies.first().expect("reply").comment,
+                "Reply text"
+            );
+            assert!(overlay.reply_editors.is_empty());
+
+            let value: serde_json::Value =
+                serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
+            assert!(value["comments"][0]["created_at"].as_str().is_some());
+            assert_eq!(value["comments"][0]["replies"][0]["body"], "Reply text");
+            assert!(
+                value["comments"][0]["replies"][0]["created_at"]
+                    .as_str()
+                    .is_some()
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_orphaned_comments_survive_buffer_edit(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
     let editor = cx.add_window(|window, cx| {
         let buffer = cx.new(|cx| Buffer::local("line 1\nline 2\nline 3\n", cx));
         let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
         Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
     });
 
-    // Add a comment with an anchor on line 2
     editor
         .update(cx, |editor, _window, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
-            let anchor = snapshot.anchor_after(Point::new(1, 0)); // Line 2
+            let anchor = snapshot.anchor_after(Point::new(1, 0));
             let key = DiffHunkKey {
                 file_path: Arc::from(util::rel_path::RelPath::empty()),
                 hunk_start_anchor: anchor,
@@ -41795,22 +41851,16 @@ fn test_orphaned_comments_cleanup_called_on_buffer_edit(cx: &mut TestAppContext)
         })
         .unwrap();
 
-    // Edit the buffer - this should trigger cleanup via on_buffer_event
-    // Delete all content which orphans the anchor
     editor
         .update(cx, |editor, window, cx| {
             editor.select_all(&SelectAll, window, cx);
             editor.insert("completely new content", window, cx);
-            // The cleanup is called automatically in on_buffer_event when Edited fires
         })
         .unwrap();
 
-    // Verify cleanup happened automatically (not manually triggered)
     editor
         .update(cx, |editor, _window, _cx| {
-            // Comment should be removed because its anchor became invalid
-            // and cleanup was called automatically on buffer edit
-            assert_eq!(editor.total_review_comment_count(), 0);
+            assert_eq!(editor.total_review_comment_count(), 1);
         })
         .unwrap();
 }

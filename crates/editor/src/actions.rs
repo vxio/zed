@@ -991,6 +991,15 @@ pub struct GoToTypeDefinition {
     pub open_results_in: Option<OpenResultsIn>,
 }
 
+actions!(
+    zed_review,
+    [
+        /// Opens a review comment prompt at the cursor line.
+        #[action(deprecated_aliases = ["editor::AddReviewCommentAtMouse"])]
+        AddComment,
+    ]
+);
+
 /// Finds all references to the symbol at cursor.
 #[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
 #[action(namespace = editor)]
@@ -1026,6 +1035,13 @@ pub struct EditReviewComment {
 #[action(namespace = editor)]
 #[serde(deny_unknown_fields)]
 pub struct DeleteReviewComment {
+    pub id: usize,
+}
+
+#[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct ReplyToReviewComment {
     pub id: usize,
 }
 
