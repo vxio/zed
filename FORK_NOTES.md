@@ -14,6 +14,8 @@ letting Amp inspect, add, and reply to review comments.
 - Distinguish human comments from Amp comments with `vxio` and `amp` authors.
 - Let Amp list comments, address them, add new comments, and reply to existing
   threads.
+- Let review comments reference code context with `@file` and `@symbol`
+  completions in the comment editor.
 - Keep the fork easy to rebase on top of daily upstream Zed changes.
 
 ## Zed implementation
@@ -27,10 +29,27 @@ Primary files:
 - `crates/editor/src/element.rs`
 - `crates/editor/src/element/mouse.rs`
 - `crates/editor/src/editor_tests.rs`
+- `Makefile`
 
 The project diff view renders persisted review threads inline with diff hunks.
 Comments have author labels, relative timestamps, edit/delete/reply actions, and
 visual styling that separates comment blocks from the surrounding diff.
+
+Review comment inputs use the editor completion menu for `@` context mentions:
+
+- `@` shows context categories.
+- `@file <query>` searches project files and directories.
+- `@symbol <query>` searches project symbols.
+- Accepted mentions are stored as markdown links for export compatibility but
+  fold into inline chips while editing, matching the agent-thread input feel.
+
+Review input editors are configured for Vim insert mode on focus, so adding a
+new comment, editing, or replying lands in an immediately typeable input.
+
+Each comment and reply has a copy-reference action. It writes a stable local
+reference to the clipboard, e.g. `zed-review:comment:12` or
+`zed-review:reply:18`, and shows a toast on success. Delete actions ask for
+confirmation before removing a comment or reply from the active review.
 
 Comments are stored in Zed's SQLite database in the
 `project_diff_review_comments` table. The active development build uses:
@@ -171,6 +190,17 @@ as successful if `/Applications/Zed Dev.app` was updated.
 Do not update this fork through Zed's UI. Treat updates as source-controlled:
 sync from upstream, rebuild, install, and push the fork.
 
+The repo also has a tiny `Makefile` for the common local commands:
+
+```fish
+make run $MOOV/accounts
+make run ARGS=$MOOV/accounts
+make build
+```
+
+`make run` calls `cargo run -- ...`. `make build` runs the `bundle-mac -i`
+install command above.
+
 ## Local tooling changes
 
 Several personal tools were repointed to prefer `Zed Dev.app`:
@@ -195,6 +225,9 @@ some shell paths.
 - The current Amp integration writes directly to Zed's SQLite database. That is
   simple and fast, but a first-class Zed command/server API would be cleaner if
   this became a long-lived integration.
+- Review `@` mentions currently render as chips only while editing comment
+  inputs. Persisted/saved comment rows still display the underlying markdown
+  link text; rendering saved comment bodies as rich mention chips is a follow-up.
 - `script/bundle-mac -i` successfully installs `Zed Dev.app` but can exit
   non-zero after installation because it continues into DMG packaging after
   moving the app bundle.

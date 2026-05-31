@@ -1060,3 +1060,17 @@ pub struct ConfirmEditReviewComment {
 pub struct CancelEditReviewComment {
     pub id: usize,
 }
+
+#[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmEditReviewReply {
+    pub id: usize,
+}
+
+#[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct CancelEditReviewReply {
+    pub id: usize,
+}
