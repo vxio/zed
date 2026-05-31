@@ -204,6 +204,16 @@
     },
   },
   {
+    "context": "Editor && review_comment_editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "enter": "menu::Confirm",
+      "shift-enter": "editor::Newline",
+      "alt-enter": "editor::Newline",
+      "cmd-f": "buffer_search::Deploy",
+    },
+  },
+  {
     "context": "Markdown",
     "use_key_equivalents": true,
     "bindings": {

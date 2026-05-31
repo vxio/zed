@@ -170,6 +170,15 @@
     },
   },
   {
+    "context": "Editor && review_comment_editor",
+    "bindings": {
+      "enter": "menu::Confirm",
+      "shift-enter": "editor::Newline",
+      "alt-enter": "editor::Newline",
+      "ctrl-f": "buffer_search::Deploy",
+    },
+  },
+  {
     "context": "Markdown",
     "bindings": {
       "copy": "markdown::Copy",

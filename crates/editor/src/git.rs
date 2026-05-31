@@ -8,7 +8,7 @@ use ::git::{
 };
 use buffer_diff::{BufferDiff, DiffHunkStatus, DiffHunkStatusKind};
 use fuzzy::{PathMatch, StringMatch, StringMatchCandidate};
-use gpui::PromptLevel;
+use gpui::{InteractiveElement as _, PromptLevel};
 use language::{CodeLabel, CodeLabelBuilder, HighlightId};
 use ordered_float::OrderedFloat;
 use project::{
@@ -23,7 +23,12 @@ use std::{
     sync::atomic::AtomicBool,
 };
 use text::{Anchor as TextAnchor, ToPoint as _};
-use util::{paths::PathStyle, rel_path::RelPath, truncate_and_remove_front};
+use util::{
+    paths::{PathStyle, UrlExt},
+    rel_path::RelPath,
+    truncate_and_remove_front,
+};
+use workspace::OpenOptions;
 
 #[derive(Clone)]
 pub struct ResolvedDiffHunk {
@@ -408,7 +413,31 @@ impl DiffReviewEditorCancel {
 
 const DEFAULT_REVIEW_COMMENT_AUTHOR: &str = "vxio";
 
-struct ReviewCommentToast;
+#[derive(Clone)]
+enum ReviewCommentBodySegment {
+    Text(String),
+    Mention(ReviewCommentMention),
+}
+
+#[derive(Clone)]
+struct ReviewCommentMention {
+    label: String,
+    url: String,
+    tooltip: Option<SharedString>,
+    icon: IconName,
+}
+
+struct ReviewCommentEditorAddon;
+
+impl Addon for ReviewCommentEditorAddon {
+    fn extend_key_context(&self, key_context: &mut KeyContext, _: &App) {
+        key_context.add("review_comment_editor");
+    }
+
+    fn to_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 struct ReviewCommentLocation {
@@ -1089,12 +1118,13 @@ fn confirm_review_mention_completion(
     content_len: usize,
     label: SharedString,
     icon_path: SharedString,
-    _tooltip: Option<SharedString>,
+    tooltip: Option<SharedString>,
     editor: WeakEntity<Editor>,
 ) -> Arc<dyn Fn(CompletionIntent, &mut Window, &mut App) -> bool + Send + Sync> {
     Arc::new(move |_, window, cx| {
         let label = label.clone();
         let icon_path = icon_path.clone();
+        let tooltip = tooltip.clone();
         let editor = editor.clone();
         window.defer(cx, move |window, cx| {
             if let Some(editor) = editor.upgrade() {
@@ -1104,6 +1134,7 @@ fn confirm_review_mention_completion(
                         content_len,
                         label,
                         icon_path,
+                        tooltip,
                         window,
                         cx,
                     );
@@ -1117,6 +1148,7 @@ fn confirm_review_mention_completion(
 fn render_review_mention_fold_button(
     icon_path: SharedString,
     label: SharedString,
+    tooltip: Option<SharedString>,
     editor: WeakEntity<Editor>,
 ) -> Arc<dyn Send + Sync + Fn(FoldId, Range<Anchor>, &mut App) -> AnyElement> {
     Arc::new(move |_fold_id, fold_range, cx| {
@@ -1124,6 +1156,7 @@ fn render_review_mention_fold_button(
             .update(cx, |editor, cx| editor.is_range_selected(&fold_range, cx))
             .unwrap_or_default();
         let element = h_flex()
+            .id(format!("diff-review-input-mention-{label}"))
             .gap_1()
             .items_center()
             .px_1p5()
@@ -1142,8 +1175,115 @@ fn render_review_mention_fold_button(
                     .color(ui::Color::Muted),
             )
             .child(Label::new(label.clone()).size(LabelSize::Small));
-        element.into_any_element()
+        element
+            .when_some(tooltip.clone(), |this, tooltip| {
+                this.tooltip(Tooltip::text(tooltip))
+            })
+            .into_any_element()
     })
+}
+
+fn parse_review_comment_body(comment: &str) -> Vec<Vec<ReviewCommentBodySegment>> {
+    comment
+        .split('\n')
+        .map(|line| parse_review_comment_line(line))
+        .collect()
+}
+
+fn parse_review_comment_line(line: &str) -> Vec<ReviewCommentBodySegment> {
+    let mut segments = Vec::new();
+    let mut remaining = line;
+
+    while let Some(open_index) = remaining.find("[@") {
+        if open_index > 0 {
+            segments.push(ReviewCommentBodySegment::Text(
+                remaining[..open_index].to_string(),
+            ));
+        }
+
+        let mention_start = &remaining[open_index..];
+        let Some(label_end) = mention_start.find("](") else {
+            segments.push(ReviewCommentBodySegment::Text(mention_start.to_string()));
+            return segments;
+        };
+        let url_start = label_end + 2;
+        let Some(url_end) = mention_start[url_start..].find(')') else {
+            segments.push(ReviewCommentBodySegment::Text(mention_start.to_string()));
+            return segments;
+        };
+
+        let label = &mention_start[2..label_end];
+        let url = &mention_start[url_start..url_start + url_end];
+        if let Some(mention) = build_review_comment_mention(label, url) {
+            segments.push(ReviewCommentBodySegment::Mention(mention));
+        } else {
+            segments.push(ReviewCommentBodySegment::Text(
+                mention_start[..url_start + url_end + 1].to_string(),
+            ));
+        }
+
+        remaining = &mention_start[url_start + url_end + 1..];
+    }
+
+    if !remaining.is_empty() || segments.is_empty() {
+        segments.push(ReviewCommentBodySegment::Text(remaining.to_string()));
+    }
+
+    segments
+}
+
+fn build_review_comment_mention(label: &str, url: &str) -> Option<ReviewCommentMention> {
+    if label.is_empty() {
+        return None;
+    }
+
+    let parsed_url = url::Url::parse(url).ok()?;
+    let icon = match parsed_url.scheme() {
+        "file" if parsed_url.query_pairs().any(|(key, _)| key == "symbol") => IconName::Code,
+        "file" if parsed_url.path().ends_with('/') => IconName::Folder,
+        "file" => IconName::File,
+        "zed" if parsed_url.path().contains("thread") => IconName::Thread,
+        "zed" if parsed_url.path().contains("git-diff") => IconName::GitBranch,
+        "zed" => IconName::Sparkle,
+        "http" | "https" => IconName::ToolWeb,
+        _ => return None,
+    };
+
+    let tooltip = if parsed_url.scheme() == "file" {
+        parsed_url
+            .to_file_path_ext(PathStyle::local())
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned().into())
+            .or_else(|| Some(url.to_string().into()))
+    } else {
+        Some(url.to_string().into())
+    };
+
+    Some(ReviewCommentMention {
+        label: label.to_string(),
+        url: url.to_string(),
+        tooltip,
+        icon,
+    })
+}
+
+fn parse_review_comment_mention_point(url: &url::Url) -> Option<Point> {
+    let fragment = url.fragment()?;
+    let range = fragment.strip_prefix('L').unwrap_or(fragment);
+    let start = range
+        .split_once(':')
+        .or_else(|| range.split_once('-'))
+        .map_or(range, |(start, _)| start.strip_prefix('L').unwrap_or(start));
+    let row = start.parse::<u32>().ok()?.checked_sub(1)?;
+    let column = url
+        .query_pairs()
+        .find_map(|(key, value)| {
+            (key == "column")
+                .then(|| value.parse::<u32>().ok()?.checked_sub(1))
+                .flatten()
+        })
+        .unwrap_or(0);
+    Some(Point::new(row, column))
 }
 
 fn extract_review_file_name_and_directory(
@@ -1299,6 +1439,13 @@ impl StoredReviewComment {
 }
 
 impl Editor {
+    fn review_comment_input_editor(window: &mut Window, cx: &mut Context<Self>) -> Editor {
+        let mut editor = Editor::auto_height(1, 6, window, cx);
+        Self::configure_review_comment_editor(&mut editor, cx);
+        editor.register_addon(ReviewCommentEditorAddon);
+        editor
+    }
+
     fn configure_review_comment_editor(editor: &mut Editor, cx: &mut Context<Self>) {
         editor.set_show_completions_on_input(Some(true));
         editor.set_use_modal_editing(true);
@@ -1327,12 +1474,26 @@ impl Editor {
         });
     }
 
+    fn install_review_comment_insert_mode_handler(
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus_handle = editor.focus_handle(cx);
+        let editor = editor.clone();
+        cx.on_focus_in(&focus_handle, window, move |_, window, cx| {
+            Self::focus_review_comment_editor(&editor, window, cx);
+        })
+        .detach();
+    }
+
     fn insert_review_mention_crease(
         &mut self,
         start: TextAnchor,
         content_len: usize,
         label: SharedString,
         icon_path: SharedString,
+        tooltip: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1347,6 +1508,7 @@ impl Editor {
             render: render_review_mention_fold_button(
                 icon_path.clone(),
                 label.clone(),
+                tooltip,
                 cx.weak_entity(),
             ),
             merge_adjacent: false,
@@ -1373,17 +1535,12 @@ impl Editor {
         if let Ok(action) = cx.build_action("vim::SwitchToInsertMode", None) {
             focus_handle.dispatch_action(action.as_ref(), window, cx);
         }
-    }
-
-    fn show_review_comment_toast(&self, message: &'static str, cx: &mut Context<Self>) {
-        if let Some(workspace) = self.workspace() {
-            workspace.update(cx, |workspace, cx| {
-                workspace.show_toast(
-                    Toast::new(NotificationId::unique::<ReviewCommentToast>(), message),
-                    cx,
-                );
-            });
-        }
+        window.defer(cx, move |window, cx| {
+            window.focus(&focus_handle, cx);
+            if let Ok(action) = cx.build_action("vim::SwitchToInsertMode", None) {
+                focus_handle.dispatch_action(action.as_ref(), window, cx);
+            }
+        });
     }
 
     pub(super) fn copy_review_comment_reference(
@@ -1398,7 +1555,6 @@ impl Editor {
             format!("zed-review:comment:{id}")
         };
         cx.write_to_clipboard(ClipboardItem::new_string(reference));
-        self.show_review_comment_toast("Copied review comment reference", cx);
     }
 
     pub(super) fn confirm_delete_review_comment(
@@ -1890,19 +2046,18 @@ impl Editor {
 
         let completion_project = self.project.as_ref().map(Entity::downgrade);
         let prompt_editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            Self::configure_review_comment_editor(&mut editor, cx);
+            let mut editor = Self::review_comment_input_editor(window, cx);
             editor.set_placeholder_text("Add a review comment...", window, cx);
             editor
         });
         Self::attach_review_comment_completion_provider(completion_project, &prompt_editor, cx);
+        Self::install_review_comment_insert_mode_handler(&prompt_editor, window, cx);
 
-        // Register the Newline action on the prompt editor to submit the review
         let parent_editor = cx.entity().downgrade();
         let subscription = prompt_editor.update(cx, |prompt_editor, _cx| {
             prompt_editor.register_action({
                 let parent_editor = parent_editor.clone();
-                move |_: &crate::actions::Newline, window, cx| {
+                move |_: &menu::Confirm, window, cx| {
                     if let Some(editor) = parent_editor.upgrade() {
                         editor.update(cx, |editor, cx| {
                             editor.submit_diff_review_comment(window, cx);
@@ -1913,7 +2068,7 @@ impl Editor {
         });
 
         let initial_height =
-            self.calculate_overlay_height(&hunk_key, true, prompt_visible, &buffer_snapshot);
+            self.calculate_overlay_height(&hunk_key, true, prompt_visible, &buffer_snapshot, cx);
 
         // Create the overlay block
         let prompt_editor_for_render = prompt_editor.clone();
@@ -3046,8 +3201,7 @@ impl Editor {
 
                     let parent_editor = cx.entity().downgrade();
                     let inline_editor = cx.new(|cx| {
-                        let mut editor = Editor::single_line(window, cx);
-                        Self::configure_review_comment_editor(&mut editor, cx);
+                        let mut editor = Self::review_comment_input_editor(window, cx);
                         editor.set_text(&*comment_text, window, cx);
                         editor.select_all(&crate::actions::SelectAll, window, cx);
                         editor.diff_review_editor_cancel = Some(DiffReviewEditorCancel::edit(
@@ -3061,11 +3215,12 @@ impl Editor {
                         &inline_editor,
                         cx,
                     );
+                    Self::install_review_comment_insert_mode_handler(&inline_editor, window, cx);
 
                     let subscription = inline_editor.update(cx, |inline_editor, _cx| {
                         let confirm_subscription = inline_editor.register_action({
                             let parent_editor = parent_editor.clone();
-                            move |_: &crate::actions::Newline, window, cx| {
+                            move |_: &menu::Confirm, window, cx| {
                                 if let Some(editor) = parent_editor.upgrade() {
                                     editor.update(cx, |editor, cx| {
                                         editor.confirm_edit_review_comment(comment_id, window, cx);
@@ -3126,8 +3281,7 @@ impl Editor {
         {
             let parent_editor = cx.entity().downgrade();
             let reply_editor = cx.new(|cx| {
-                let mut editor = Editor::single_line(window, cx);
-                Self::configure_review_comment_editor(&mut editor, cx);
+                let mut editor = Self::review_comment_input_editor(window, cx);
                 editor.set_placeholder_text("Reply...", window, cx);
                 editor.diff_review_editor_cancel = Some(DiffReviewEditorCancel::reply(
                     parent_editor.clone(),
@@ -3136,11 +3290,12 @@ impl Editor {
                 editor
             });
             Self::attach_review_comment_completion_provider(completion_project, &reply_editor, cx);
+            Self::install_review_comment_insert_mode_handler(&reply_editor, window, cx);
 
             let subscription = reply_editor.update(cx, |reply_editor, _cx| {
                 let submit_subscription = reply_editor.register_action({
                     let parent_editor = parent_editor.clone();
-                    move |_: &crate::actions::Newline, window, cx| {
+                    move |_: &menu::Confirm, window, cx| {
                         if let Some(editor) = parent_editor.upgrade() {
                             editor.update(cx, |editor, cx| {
                                 editor.submit_review_reply(comment_id, window, cx);
@@ -3512,8 +3667,7 @@ impl Editor {
                 {
                     let parent_editor = cx.entity().downgrade();
                     let inline_editor = cx.new(|cx| {
-                        let mut editor = Editor::single_line(window, cx);
-                        Self::configure_review_comment_editor(&mut editor, cx);
+                        let mut editor = Self::review_comment_input_editor(window, cx);
                         editor.set_text(&*reply_text, window, cx);
                         editor.select_all(&crate::actions::SelectAll, window, cx);
                         editor.diff_review_editor_cancel = Some(
@@ -3526,11 +3680,12 @@ impl Editor {
                         &inline_editor,
                         cx,
                     );
+                    Self::install_review_comment_insert_mode_handler(&inline_editor, window, cx);
 
                     let subscription = inline_editor.update(cx, |inline_editor, _cx| {
                         let confirm_subscription = inline_editor.register_action({
                             let parent_editor = parent_editor.clone();
-                            move |_: &crate::actions::Newline, window, cx| {
+                            move |_: &menu::Confirm, window, cx| {
                                 if let Some(editor) = parent_editor.upgrade() {
                                     editor.update(cx, |editor, cx| {
                                         editor.confirm_edit_review_reply(reply_id, window, cx);
@@ -4003,29 +4158,64 @@ impl Editor {
         comments_expanded: bool,
         prompt_visible: bool,
         snapshot: &MultiBufferSnapshot,
+        cx: &App,
     ) -> u32 {
-        let comment_count = self.hunk_comment_count(hunk_key, snapshot);
-        let prompt_height: u32 = if prompt_visible { 2 } else { 0 };
+        fn text_height(text: &str) -> u32 {
+            (text.bytes().filter(|byte| *byte == b'\n').count() as u32 + 1).clamp(1, 6) + 1
+        }
+
+        fn editor_height(editor: &Entity<Editor>, cx: &App) -> u32 {
+            text_height(&editor.read(cx).text(cx))
+        }
+
+        let comments = self.comments_for_hunk(hunk_key, snapshot);
+        let comment_count = comments.len();
+        let overlay = self
+            .diff_review_overlays
+            .iter()
+            .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, snapshot));
+        let prompt_height: u32 = if prompt_visible {
+            overlay
+                .map(|overlay| editor_height(&overlay.prompt_editor, cx))
+                .unwrap_or(2)
+        } else {
+            0
+        };
 
         if comment_count == 0 {
             prompt_height
         } else if comments_expanded {
-            let reply_count = self
-                .comments_for_hunk(hunk_key, snapshot)
+            let comment_height = comments
                 .iter()
-                .map(|comment| comment.replies.len() as u32)
+                .map(|comment| {
+                    overlay
+                        .and_then(|overlay| overlay.inline_edit_editors.get(&comment.id))
+                        .map(|editor| editor_height(editor, cx))
+                        .unwrap_or_else(|| text_height(&comment.comment))
+                        + comment
+                            .replies
+                            .iter()
+                            .map(|reply| {
+                                overlay
+                                    .and_then(|overlay| {
+                                        overlay.inline_reply_edit_editors.get(&reply.id)
+                                    })
+                                    .map(|editor| editor_height(editor, cx))
+                                    .unwrap_or_else(|| text_height(&reply.comment))
+                            })
+                            .sum::<u32>()
+                })
                 .sum::<u32>();
-            let reply_editor_count = self
-                .diff_review_overlays
-                .iter()
-                .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, snapshot))
-                .map(|overlay| overlay.reply_editors.len() as u32)
+            let reply_editor_height = overlay
+                .map(|overlay| {
+                    overlay
+                        .reply_editors
+                        .values()
+                        .map(|editor| editor_height(editor, cx))
+                        .sum::<u32>()
+                })
                 .unwrap_or(0);
-            prompt_height
-                + 1
-                + (comment_count as u32 * 2)
-                + (reply_count * 2)
-                + (reply_editor_count * 2)
+            prompt_height + 1 + comment_height + reply_editor_height
         } else {
             prompt_height + 1
         }
@@ -4412,8 +4602,13 @@ impl Editor {
         };
 
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let new_height =
-            self.calculate_overlay_height(hunk_key, comments_expanded, prompt_visible, &snapshot);
+        let new_height = self.calculate_overlay_height(
+            hunk_key,
+            comments_expanded,
+            prompt_visible,
+            &snapshot,
+            cx,
+        );
 
         let mut heights = HashMap::default();
         heights.insert(block_id, new_height);
@@ -4779,6 +4974,7 @@ impl Editor {
         let edit_editor_handle = editor_handle.clone();
         let reply_editor_handle = editor_handle.clone();
         let copy_editor_handle = editor_handle.clone();
+        let body_editor_handle = editor_handle.clone();
         let cancel_reply_editor_handle = editor_handle.clone();
         let submit_reply_editor_handle = editor_handle.clone();
         let delete_editor_handle = editor_handle.clone();
@@ -4817,7 +5013,11 @@ impl Editor {
                             .flex_1()
                             .text_sm()
                             .text_color(colors.text)
-                            .child(comment.comment)
+                            .child(Self::render_review_comment_body(
+                                comment.comment,
+                                body_editor_handle,
+                                colors,
+                            ))
                             .into_any_element()
                     })
                     .child(if is_editing {
@@ -4971,6 +5171,7 @@ impl Editor {
                 let delete_reply_handle = reply_row_editor_handle.clone();
                 let cancel_reply_edit_handle = reply_row_editor_handle.clone();
                 let confirm_reply_edit_handle = reply_row_editor_handle.clone();
+                let reply_body_editor_handle = reply_row_editor_handle.clone();
                 h_flex()
                     .ml_4()
                     .items_center()
@@ -4998,7 +5199,11 @@ impl Editor {
                             .flex_1()
                             .text_sm()
                             .text_color(colors.text)
-                            .child(reply.comment)
+                            .child(Self::render_review_comment_body(
+                                reply.comment,
+                                reply_body_editor_handle,
+                                colors,
+                            ))
                             .into_any_element()
                     })
                     .child(if is_editing_reply {
@@ -5209,6 +5414,153 @@ impl Editor {
                         ),
                 )
             })
+    }
+
+    fn render_review_comment_body(
+        comment: String,
+        editor_handle: WeakEntity<Editor>,
+        colors: &theme::ThemeColors,
+    ) -> AnyElement {
+        let text_color = colors.text;
+        let border_color = colors.border_variant;
+        let background = colors.element_background;
+
+        v_flex()
+            .gap_0p5()
+            .children(parse_review_comment_body(&comment).into_iter().map(|line| {
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .children(line.into_iter().map(|segment| {
+                        match segment {
+                            ReviewCommentBodySegment::Text(text) => div()
+                                .text_sm()
+                                .text_color(text_color)
+                                .child(text)
+                                .into_any_element(),
+                            ReviewCommentBodySegment::Mention(mention) => {
+                                Self::render_review_mention(
+                                    mention,
+                                    editor_handle.clone(),
+                                    border_color,
+                                    background,
+                                )
+                            }
+                        }
+                    }))
+            }))
+            .into_any_element()
+    }
+
+    fn render_review_mention(
+        mention: ReviewCommentMention,
+        editor_handle: WeakEntity<Editor>,
+        border_color: Hsla,
+        background: Hsla,
+    ) -> AnyElement {
+        let label = mention.label;
+        let url = mention.url;
+        let tooltip = mention.tooltip;
+
+        let chip = h_flex()
+            .id(format!("diff-review-mention-{url}"))
+            .items_center()
+            .gap_1()
+            .h_5()
+            .px_1p5()
+            .rounded_md()
+            .border_1()
+            .border_color(border_color)
+            .bg(background)
+            .cursor_pointer()
+            .child(
+                Icon::new(mention.icon)
+                    .size(IconSize::XSmall)
+                    .color(ui::Color::Muted),
+            )
+            .child(Label::new(format!("@{label}")).size(LabelSize::Small))
+            .on_click(move |_, window, cx| {
+                if let Some(editor) = editor_handle.upgrade() {
+                    editor.update(cx, |editor, cx| {
+                        editor.open_review_comment_mention(&url, window, cx);
+                    });
+                }
+            });
+
+        chip.when_some(tooltip, |this, tooltip| {
+            this.tooltip(Tooltip::text(tooltip))
+        })
+        .into_any_element()
+    }
+
+    fn open_review_comment_mention(
+        &mut self,
+        mention_url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(url) = url::Url::parse(mention_url) else {
+            return;
+        };
+
+        if url.scheme() != "file" {
+            cx.open_url(mention_url);
+            return;
+        }
+
+        let Some(workspace) = self.workspace() else {
+            cx.open_url(mention_url);
+            return;
+        };
+
+        workspace.update(cx, |workspace, cx| {
+            let path_style = workspace.path_style(cx);
+            let Ok(abs_path) = url.to_file_path_ext(path_style) else {
+                cx.open_url(mention_url);
+                return;
+            };
+            let point = parse_review_comment_mention_point(&url);
+            let project = workspace.project();
+            let item = if let Some(project_path) =
+                project.update(cx, |project, cx| project.find_project_path(&abs_path, cx))
+            {
+                workspace.open_path(project_path, None, true, window, cx)
+            } else if abs_path.exists() {
+                workspace.open_abs_path(
+                    abs_path,
+                    OpenOptions {
+                        focus: Some(true),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            } else {
+                cx.open_url(mention_url);
+                return;
+            };
+
+            if let Some(point) = point {
+                window
+                    .spawn(cx, async move |cx| {
+                        let Some(editor) = item.await?.downcast::<Editor>() else {
+                            return anyhow::Ok(());
+                        };
+                        editor.update_in(cx, |editor, window, cx| {
+                            editor.change_selections(
+                                SelectionEffects::scroll(Autoscroll::center()),
+                                window,
+                                cx,
+                                |selections| selections.select_ranges([point..point]),
+                            );
+                        })?;
+                        anyhow::Ok(())
+                    })
+                    .detach_and_log_err(cx);
+            } else {
+                item.detach_and_log_err(cx);
+            }
+        });
     }
 
     fn render_author_badge(

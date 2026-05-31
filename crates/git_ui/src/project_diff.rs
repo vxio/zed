@@ -2988,20 +2988,17 @@ impl Render for ProjectDiffToolbar {
 }
 
 fn render_send_review_to_agent_button(review_count: usize, focus_handle: &FocusHandle) -> Button {
-    Button::new(
-        "send-review",
-        format!("Copy Review Comments ({})", review_count),
-    )
-    .start_icon(
-        Icon::new(IconName::ZedAssistant)
-            .size(IconSize::Small)
-            .color(Color::Muted),
-    )
-    .tooltip(Tooltip::for_action_title_in(
-        "Copy all review comments as JSON for an agent",
-        &SendReviewToAgent,
-        focus_handle,
-    ))
+    Button::new("send-review", format!("Copy Cmts ({})", review_count))
+        .start_icon(
+            Icon::new(IconName::ZedAssistant)
+                .size(IconSize::Small)
+                .color(Color::Muted),
+        )
+        .tooltip(Tooltip::for_action_title_in(
+            "Copy all review comments as JSON for an agent",
+            &SendReviewToAgent,
+            focus_handle,
+        ))
 }
 
 pub struct BranchDiffToolbar {

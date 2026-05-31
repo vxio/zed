@@ -225,9 +225,16 @@ some shell paths.
 - The current Amp integration writes directly to Zed's SQLite database. That is
   simple and fast, but a first-class Zed command/server API would be cleaner if
   this became a long-lived integration.
-- Review `@` mentions currently render as chips only while editing comment
-  inputs. Persisted/saved comment rows still display the underlying markdown
-  link text; rendering saved comment bodies as rich mention chips is a follow-up.
+- Review `@` mentions are stored as markdown links for persistence/export, then
+  rendered as clickable chips in saved comments and replies. File and symbol
+  chips open the target in Zed; hovering shows the target URL/path in both the
+  input editor and saved comment view.
+- Review comment inputs explicitly refocus after mount and switch Vim into
+  insert mode so new, reply, and edit flows are ready for typing.
+- Review inputs are auto-height editors: Enter submits, while Shift-Enter and
+  Alt-Enter insert a newline into the comment body.
+- Copying a review comment/reply reference writes directly to the clipboard
+  without showing a persistent toast.
 - `script/bundle-mac -i` successfully installs `Zed Dev.app` but can exit
   non-zero after installation because it continues into DMG packaging after
   moving the app bundle.
