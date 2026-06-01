@@ -7,6 +7,7 @@ run:
 
 build:
 	env TERM=xterm-256color FORCE_COLOR=1 ./script/bundle-mac -i
+	@echo "Successfully built and installed /Applications/Zed Dev.app"
 
 %:
 	@:

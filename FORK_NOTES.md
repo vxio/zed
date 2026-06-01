@@ -35,6 +35,10 @@ The project diff view renders persisted review threads inline with diff hunks.
 Comments have author labels, relative timestamps, edit/delete/reply actions, and
 visual styling that separates comment blocks from the surrounding diff.
 
+Saved comment and reply bodies render as read-only embedded editors. This keeps
+long text wrapping stable while allowing normal mouse selection and copy, and it
+still folds stored `@file`, `@symbol`, and markdown links into clickable chips.
+
 Review comment inputs use the editor completion menu for `@` context mentions:
 
 - `@` shows context categories.
@@ -48,8 +52,8 @@ new comment, editing, or replying lands in an immediately typeable input.
 
 Each comment and reply has a copy-reference action. It writes a stable local
 reference to the clipboard, e.g. `zed-review:comment:12` or
-`zed-review:reply:18`, and shows a toast on success. Delete actions ask for
-confirmation before removing a comment or reply from the active review.
+`zed-review:reply:18`. Delete actions ask for confirmation before removing a
+comment or reply from the active review.
 
 Comments are stored in Zed's SQLite database in the
 `project_diff_review_comments` table. The active development build uses:
@@ -104,6 +108,13 @@ The Amp plugin lives outside this repo:
 ~/.config/amp/plugins/zed-review.ts
 ```
 
+The shared CLI lives outside this repo:
+
+```text
+~/.config/scripts/zed-review
+~/.local/bin/zed-review -> ~/.config/scripts/zed-review
+```
+
 It exposes tools/commands for agents to:
 
 - list current review comments
@@ -115,9 +126,18 @@ It exposes tools/commands for agents to:
 Amp-authored comments use `author = "amp"`. Human comments use
 `author = "vxio"`.
 
-The plugin writes directly to the same SQLite table that Zed reads. Zed's diff
-pane polls the DB file mtime and refreshes comments when the database changes,
-so Amp-created comments appear without manually reopening the diff pane.
+The plugin shells out to `zed-review` instead of owning database logic itself.
+The CLI reads and writes the same SQLite table that Zed reads. Zed's diff pane
+polls the DB file mtime and refreshes comments when the database changes, so
+Amp-created comments appear without manually reopening the diff pane.
+
+Useful CLI commands:
+
+```fish
+zed-review --repo $MOOV/accounts list --format compact
+zed-review --repo $MOOV/accounts add --file internal/foo.go --line-start 42 --body "check this"
+zed-review --repo $MOOV/accounts reply --comment-id 1 --body "fixed"
+```
 
 ## Archive CLI/TUI
 
@@ -183,9 +203,8 @@ env TERM=xterm-256color FORCE_COLOR=1 ./script/bundle-mac -i
 `TERM=xterm-256color FORCE_COLOR=1` avoids a `cargo-bundle` terminal-color panic
 seen when running under non-interactive agent shells.
 
-`script/bundle-mac -i` currently installs `/Applications/Zed Dev.app` and then
-may exit non-zero while trying to continue into DMG packaging. Treat the install
-as successful if `/Applications/Zed Dev.app` was updated.
+`script/bundle-mac -i` returns after installing `/Applications/Zed Dev.app` for
+local `-i` builds, so `make build` does not continue into DMG packaging.
 
 Do not update this fork through Zed's UI. Treat updates as source-controlled:
 sync from upstream, rebuild, install, and push the fork.
@@ -222,9 +241,11 @@ some shell paths.
   editor diff plumbing are the most likely conflict points during rebases.
 - The review-comment DB schema is local to this fork and may need migration work
   if upstream changes Zed's database/domain migration patterns.
-- The current Amp integration writes directly to Zed's SQLite database. That is
-  simple and fast, but a first-class Zed command/server API would be cleaner if
-  this became a long-lived integration.
+- The current Amp integration still uses Zed's SQLite database as the API. That
+  is simple and fast, and the DB access is centralized in the `zed-review` CLI
+  so Amp and terminal workflows share one implementation. A first-class Zed
+  command/server API would still be cleaner if this became a long-lived
+  integration.
 - Review `@` mentions are stored as markdown links for persistence/export, then
   rendered as clickable chips in saved comments and replies. File and symbol
   chips open the target in Zed; hovering shows the target URL/path in both the
@@ -235,6 +256,5 @@ some shell paths.
   Alt-Enter insert a newline into the comment body.
 - Copying a review comment/reply reference writes directly to the clipboard
   without showing a persistent toast.
-- `script/bundle-mac -i` successfully installs `Zed Dev.app` but can exit
-  non-zero after installation because it continues into DMG packaging after
-  moving the app bundle.
+- `make build` installs `Zed Dev.app` and prints a successful build message
+  after `script/bundle-mac -i` returns.

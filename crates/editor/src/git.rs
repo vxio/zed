@@ -425,6 +425,13 @@ struct ReviewCommentMention {
     url: String,
     tooltip: Option<SharedString>,
     icon: IconName,
+    show_at_prefix: bool,
+}
+
+struct ReviewCommentMentionSpan {
+    start: usize,
+    len: usize,
+    mention: ReviewCommentMention,
 }
 
 struct ReviewCommentEditorAddon;
@@ -1148,11 +1155,13 @@ fn confirm_review_mention_completion(
 fn render_review_mention_fold_button(
     icon_path: SharedString,
     label: SharedString,
+    url: Option<SharedString>,
     tooltip: Option<SharedString>,
-    editor: WeakEntity<Editor>,
+    selection_editor: WeakEntity<Editor>,
+    open_editor: WeakEntity<Editor>,
 ) -> Arc<dyn Send + Sync + Fn(FoldId, Range<Anchor>, &mut App) -> AnyElement> {
     Arc::new(move |_fold_id, fold_range, cx| {
-        let is_selected = editor
+        let is_selected = selection_editor
             .update(cx, |editor, cx| editor.is_range_selected(&fold_range, cx))
             .unwrap_or_default();
         let element = h_flex()
@@ -1179,6 +1188,17 @@ fn render_review_mention_fold_button(
             .when_some(tooltip.clone(), |this, tooltip| {
                 this.tooltip(Tooltip::text(tooltip))
             })
+            .on_click({
+                let open_editor = open_editor.clone();
+                let url = url.clone();
+                move |_, window, cx| {
+                    if let (Some(url), Some(editor)) = (url.as_ref(), open_editor.upgrade()) {
+                        editor.update(cx, |editor, cx| {
+                            editor.open_review_comment_mention(url, window, cx);
+                        });
+                    }
+                }
+            })
             .into_any_element()
     })
 }
@@ -1190,39 +1210,101 @@ fn parse_review_comment_body(comment: &str) -> Vec<Vec<ReviewCommentBodySegment>
         .collect()
 }
 
+fn review_comment_mention_spans(comment: &str) -> Vec<ReviewCommentMentionSpan> {
+    let mut spans = Vec::new();
+    let mut remaining = comment;
+    let mut offset = 0;
+
+    while let Some(open_index) = remaining.find('[') {
+        let link_start = &remaining[open_index..];
+        let Some(label_end) = find_review_comment_markdown_delimiter(link_start, '[', ']') else {
+            break;
+        };
+        if link_start.get(label_end + 1..label_end + 2) != Some("(") {
+            offset += open_index + 1;
+            remaining = &link_start[1..];
+            continue;
+        }
+
+        let url_start = label_end + 2;
+        let Some(url_end_relative) =
+            find_review_comment_markdown_delimiter(&link_start[label_end + 1..], '(', ')')
+        else {
+            break;
+        };
+        let url_end = label_end + 1 + url_end_relative;
+        let raw_label = &link_start[1..label_end];
+        let (label, show_at_prefix) = raw_label
+            .strip_prefix('@')
+            .map_or((raw_label, false), |label| (label, true));
+        let url = &link_start[url_start..url_end];
+        if let Some(mention) = build_review_comment_mention(label, url) {
+            spans.push(ReviewCommentMentionSpan {
+                start: offset + open_index,
+                len: url_end + 1,
+                mention: ReviewCommentMention {
+                    show_at_prefix,
+                    ..mention
+                },
+            });
+        }
+
+        let consumed = open_index + url_end + 1;
+        offset += consumed;
+        remaining = &remaining[consumed..];
+    }
+
+    spans
+}
+
 fn parse_review_comment_line(line: &str) -> Vec<ReviewCommentBodySegment> {
     let mut segments = Vec::new();
     let mut remaining = line;
 
-    while let Some(open_index) = remaining.find("[@") {
+    while let Some(open_index) = remaining.find('[') {
         if open_index > 0 {
             segments.push(ReviewCommentBodySegment::Text(
                 remaining[..open_index].to_string(),
             ));
         }
 
-        let mention_start = &remaining[open_index..];
-        let Some(label_end) = mention_start.find("](") else {
-            segments.push(ReviewCommentBodySegment::Text(mention_start.to_string()));
+        let link_start = &remaining[open_index..];
+        let Some(label_end) = find_review_comment_markdown_delimiter(link_start, '[', ']') else {
+            segments.push(ReviewCommentBodySegment::Text(link_start.to_string()));
             return segments;
         };
-        let url_start = label_end + 2;
-        let Some(url_end) = mention_start[url_start..].find(')') else {
-            segments.push(ReviewCommentBodySegment::Text(mention_start.to_string()));
-            return segments;
-        };
+        if link_start.get(label_end + 1..label_end + 2) != Some("(") {
+            segments.push(ReviewCommentBodySegment::Text("[".to_string()));
+            remaining = &link_start[1..];
+            continue;
+        }
 
-        let label = &mention_start[2..label_end];
-        let url = &mention_start[url_start..url_start + url_end];
+        let url_start = label_end + 2;
+        let Some(url_end_relative) =
+            find_review_comment_markdown_delimiter(&link_start[label_end + 1..], '(', ')')
+        else {
+            segments.push(ReviewCommentBodySegment::Text(link_start.to_string()));
+            return segments;
+        };
+        let url_end = label_end + 1 + url_end_relative;
+
+        let raw_label = &link_start[1..label_end];
+        let (label, show_at_prefix) = raw_label
+            .strip_prefix('@')
+            .map_or((raw_label, false), |label| (label, true));
+        let url = &link_start[url_start..url_end];
         if let Some(mention) = build_review_comment_mention(label, url) {
-            segments.push(ReviewCommentBodySegment::Mention(mention));
+            segments.push(ReviewCommentBodySegment::Mention(ReviewCommentMention {
+                show_at_prefix,
+                ..mention
+            }));
         } else {
             segments.push(ReviewCommentBodySegment::Text(
-                mention_start[..url_start + url_end + 1].to_string(),
+                link_start[..url_end + 1].to_string(),
             ));
         }
 
-        remaining = &mention_start[url_start + url_end + 1..];
+        remaining = &link_start[url_end + 1..];
     }
 
     if !remaining.is_empty() || segments.is_empty() {
@@ -1230,6 +1312,21 @@ fn parse_review_comment_line(line: &str) -> Vec<ReviewCommentBodySegment> {
     }
 
     segments
+}
+
+fn find_review_comment_markdown_delimiter(text: &str, open: char, close: char) -> Option<usize> {
+    let mut depth = 0;
+    for (index, character) in text.char_indices() {
+        if character == open {
+            depth += 1;
+        } else if character == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
 }
 
 fn build_review_comment_mention(label: &str, url: &str) -> Option<ReviewCommentMention> {
@@ -1264,6 +1361,7 @@ fn build_review_comment_mention(label: &str, url: &str) -> Option<ReviewCommentM
         url: url.to_string(),
         tooltip,
         icon,
+        show_at_prefix: true,
     })
 }
 
@@ -1384,6 +1482,8 @@ pub(super) struct DiffReviewOverlay {
     pub(super) inline_reply_edit_subscriptions: HashMap<usize, Subscription>,
     pub(super) reply_editors: HashMap<usize, Entity<Editor>>,
     pub(super) reply_subscriptions: HashMap<usize, Subscription>,
+    pub(super) body_editors: HashMap<usize, Entity<Editor>>,
+    pub(super) reply_body_editors: HashMap<usize, Entity<Editor>>,
     pub(super) user_avatar_uri: Option<SharedUri>,
     _subscription: Subscription,
 }
@@ -1446,6 +1546,29 @@ impl Editor {
         editor
     }
 
+    fn review_comment_body_editor(
+        comment: String,
+        open_editor: WeakEntity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Editor> {
+        cx.new(|cx| {
+            let mut editor = Editor::auto_height_unbounded(1, window, cx);
+            editor.set_text(comment.clone(), window, cx);
+            editor.set_read_only(true);
+            editor.set_use_modal_editing(false);
+            editor.set_show_gutter(false, cx);
+            editor.set_show_line_numbers(false, cx);
+            editor.set_show_git_diff_gutter(false, cx);
+            editor.set_show_indent_guides(false, cx);
+            editor.set_show_vertical_scrollbar(false, cx);
+            editor.set_show_horizontal_scrollbar(false, cx);
+            editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
+            editor.insert_review_body_mention_creases(&comment, open_editor, window, cx);
+            editor
+        })
+    }
+
     fn configure_review_comment_editor(editor: &mut Editor, cx: &mut Context<Self>) {
         editor.set_show_completions_on_input(Some(true));
         editor.set_use_modal_editing(true);
@@ -1497,6 +1620,31 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.insert_review_mention_crease_with_opener(
+            start,
+            content_len,
+            label,
+            icon_path,
+            None,
+            tooltip,
+            cx.weak_entity(),
+            window,
+            cx,
+        );
+    }
+
+    fn insert_review_mention_crease_with_opener(
+        &mut self,
+        start: TextAnchor,
+        content_len: usize,
+        label: SharedString,
+        icon_path: SharedString,
+        url: Option<SharedString>,
+        tooltip: Option<SharedString>,
+        open_editor: WeakEntity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let snapshot = self.buffer().read(cx).snapshot(cx);
         let Some(start) = snapshot.anchor_in_excerpt(start) else {
             return;
@@ -1508,8 +1656,10 @@ impl Editor {
             render: render_review_mention_fold_button(
                 icon_path.clone(),
                 label.clone(),
+                url,
                 tooltip,
                 cx.weak_entity(),
+                open_editor,
             ),
             merge_adjacent: false,
             ..Default::default()
@@ -1523,6 +1673,38 @@ impl Editor {
         };
         self.insert_creases(vec![crease.clone()], cx);
         self.fold_creases(vec![crease], false, window, cx);
+    }
+
+    fn insert_review_body_mention_creases(
+        &mut self,
+        comment: &str,
+        open_editor: WeakEntity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.buffer().read(cx).snapshot(cx);
+        let Some(buffer_snapshot) = snapshot.as_singleton() else {
+            return;
+        };
+        let spans = review_comment_mention_spans(comment);
+        for span in spans {
+            let label = if span.mention.show_at_prefix {
+                format!("@{}", span.mention.label)
+            } else {
+                span.mention.label
+            };
+            self.insert_review_mention_crease_with_opener(
+                buffer_snapshot.anchor_before(span.start),
+                span.len,
+                label.into(),
+                span.mention.icon.path().into(),
+                Some(span.mention.url.into()),
+                span.mention.tooltip,
+                open_editor.clone(),
+                window,
+                cx,
+            );
+        }
     }
 
     fn focus_review_comment_editor(
@@ -2099,7 +2281,7 @@ impl Editor {
             anchor_range,
             block_id,
             prompt_editor: prompt_editor.clone(),
-            hunk_key,
+            hunk_key: hunk_key.clone(),
             comments_expanded: true,
             prompt_visible,
             inline_edit_editors: HashMap::default(),
@@ -2108,9 +2290,13 @@ impl Editor {
             inline_reply_edit_subscriptions: HashMap::default(),
             reply_editors: HashMap::default(),
             reply_subscriptions: HashMap::default(),
+            body_editors: HashMap::default(),
+            reply_body_editors: HashMap::default(),
             user_avatar_uri,
             _subscription: subscription,
         });
+
+        self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
 
         if prompt_visible {
             Self::focus_review_comment_editor(&prompt_editor, window, cx);
@@ -2663,6 +2849,75 @@ impl Editor {
             })
             .map(|(_, v)| v.len())
             .unwrap_or(0)
+    }
+
+    fn sync_review_comment_body_editors(
+        &mut self,
+        hunk_key: &DiffHunkKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let comments = self.comments_for_hunk(hunk_key, &snapshot).to_vec();
+        let Some(overlay_index) = self
+            .diff_review_overlays
+            .iter()
+            .position(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, &snapshot))
+        else {
+            return;
+        };
+
+        let comment_ids = comments
+            .iter()
+            .map(|comment| comment.id)
+            .collect::<HashSet<_>>();
+        let reply_ids = comments
+            .iter()
+            .flat_map(|comment| comment.replies.iter().map(|reply| reply.id))
+            .collect::<HashSet<_>>();
+        self.diff_review_overlays[overlay_index]
+            .body_editors
+            .retain(|id, _| comment_ids.contains(id));
+        self.diff_review_overlays[overlay_index]
+            .reply_body_editors
+            .retain(|id, _| reply_ids.contains(id));
+
+        let open_editor = cx.entity().downgrade();
+        for comment in comments {
+            let needs_comment_editor = self.diff_review_overlays[overlay_index]
+                .body_editors
+                .get(&comment.id)
+                .is_none_or(|editor| editor.read(cx).text(cx) != comment.comment);
+            if needs_comment_editor {
+                let body_editor = Self::review_comment_body_editor(
+                    comment.comment.clone(),
+                    open_editor.clone(),
+                    window,
+                    cx,
+                );
+                self.diff_review_overlays[overlay_index]
+                    .body_editors
+                    .insert(comment.id, body_editor);
+            }
+
+            for reply in comment.replies {
+                let needs_reply_editor = self.diff_review_overlays[overlay_index]
+                    .reply_body_editors
+                    .get(&reply.id)
+                    .is_none_or(|editor| editor.read(cx).text(cx) != reply.comment);
+                if needs_reply_editor {
+                    let body_editor = Self::review_comment_body_editor(
+                        reply.comment.clone(),
+                        open_editor.clone(),
+                        window,
+                        cx,
+                    );
+                    self.diff_review_overlays[overlay_index]
+                        .reply_body_editors
+                        .insert(reply.id, body_editor);
+                }
+            }
+        }
     }
 
     fn hunk_key_for_review_comment(&self, id: usize) -> Option<DiffHunkKey> {
@@ -4161,7 +4416,16 @@ impl Editor {
         cx: &App,
     ) -> u32 {
         fn text_height(text: &str) -> u32 {
-            (text.bytes().filter(|byte| *byte == b'\n').count() as u32 + 1).clamp(1, 6) + 1
+            const ESTIMATED_WRAP_COLUMNS: usize = 48;
+
+            text.lines()
+                .map(|line| {
+                    let character_count = line.chars().count().max(1);
+                    character_count.div_ceil(ESTIMATED_WRAP_COLUMNS) as u32
+                })
+                .sum::<u32>()
+                .clamp(1, 12)
+                + 1
         }
 
         fn editor_height(editor: &Entity<Editor>, cx: &App) -> u32 {
@@ -4580,9 +4844,11 @@ impl Editor {
     fn refresh_diff_review_overlay_height(
         &mut self,
         hunk_key: &DiffHunkKey,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.sync_review_comment_body_editors(hunk_key, window, cx);
+
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let (comments_expanded, prompt_visible, block_id, prompt_editor) = {
             let Some(overlay) = self
@@ -4676,6 +4942,8 @@ impl Editor {
             inline_editors,
             inline_reply_editors,
             reply_editors,
+            body_editors,
+            reply_body_editors,
             user_avatar_uri,
             line_ranges,
         ) = editor_handle
@@ -4690,6 +4958,8 @@ impl Editor {
                     editors,
                     inline_reply_editors,
                     reply_editors,
+                    body_editors,
+                    reply_body_editors,
                     avatar_uri,
                     line_ranges,
                 ) = editor
@@ -4714,6 +4984,8 @@ impl Editor {
                             o.inline_edit_editors.clone(),
                             o.inline_reply_edit_editors.clone(),
                             o.reply_editors.clone(),
+                            o.body_editors.clone(),
+                            o.reply_body_editors.clone(),
                             o.user_avatar_uri.clone(),
                             if ranges.is_empty() {
                                 None
@@ -4728,6 +5000,8 @@ impl Editor {
                         HashMap::default(),
                         HashMap::default(),
                         HashMap::default(),
+                        HashMap::default(),
+                        HashMap::default(),
                         None,
                         None,
                     ));
@@ -4738,6 +5012,8 @@ impl Editor {
                     editors,
                     inline_reply_editors,
                     reply_editors,
+                    body_editors,
+                    reply_body_editors,
                     avatar_uri,
                     line_ranges,
                 )
@@ -4746,6 +5022,8 @@ impl Editor {
                 Vec::new(),
                 true,
                 false,
+                HashMap::default(),
+                HashMap::default(),
                 HashMap::default(),
                 HashMap::default(),
                 HashMap::default(),
@@ -4759,6 +5037,7 @@ impl Editor {
 
         v_flex()
             .w_full()
+            .min_w_0()
             .bg(colors.editor_background)
             .border_b_1()
             .border_color(colors.border)
@@ -4783,6 +5062,7 @@ impl Editor {
                 el.child(
                     h_flex()
                         .w_full()
+                        .min_w_0()
                         .items_center()
                         .gap_2()
                         .px_2()
@@ -4808,6 +5088,7 @@ impl Editor {
                         )
                         .child(
                             div()
+                                .min_w_0()
                                 .flex_1()
                                 .border_1()
                                 .border_color(colors.border)
@@ -4871,6 +5152,8 @@ impl Editor {
                     inline_editors,
                     inline_reply_editors,
                     reply_editors,
+                    body_editors,
+                    reply_body_editors,
                     user_avatar_uri,
                     editor_handle.clone(),
                     avatar_size,
@@ -4887,6 +5170,8 @@ impl Editor {
         inline_editors: HashMap<usize, Entity<Editor>>,
         inline_reply_editors: HashMap<usize, Entity<Editor>>,
         reply_editors: HashMap<usize, Entity<Editor>>,
+        body_editors: HashMap<usize, Entity<Editor>>,
+        reply_body_editors: HashMap<usize, Entity<Editor>>,
         user_avatar_uri: Option<SharedUri>,
         editor_handle: WeakEntity<Editor>,
         avatar_size: Pixels,
@@ -4897,11 +5182,13 @@ impl Editor {
 
         v_flex()
             .w_full()
+            .min_w_0()
             .gap_1()
             .child(
                 h_flex()
                     .id("review-comments-header")
                     .w_full()
+                    .min_w_0()
                     .items_center()
                     .gap_1()
                     .px_2()
@@ -4939,11 +5226,15 @@ impl Editor {
                     let inline_editor = inline_editors.get(&comment.id).cloned();
                     let inline_reply_editors = inline_reply_editors.clone();
                     let reply_editor = reply_editors.get(&comment.id).cloned();
+                    let body_editor = body_editors.get(&comment.id).cloned();
+                    let reply_body_editors = reply_body_editors.clone();
                     Self::render_comment_row(
                         comment,
                         inline_editor,
                         inline_reply_editors,
                         reply_editor,
+                        body_editor,
+                        reply_body_editors,
                         user_avatar_uri.clone(),
                         editor_handle.clone(),
                         avatar_size,
@@ -4959,12 +5250,14 @@ impl Editor {
         inline_editor: Option<Entity<Editor>>,
         inline_reply_editors: HashMap<usize, Entity<Editor>>,
         reply_editor: Option<Entity<Editor>>,
+        body_editor: Option<Entity<Editor>>,
+        reply_body_editors: HashMap<usize, Entity<Editor>>,
         _user_avatar_uri: Option<SharedUri>,
         editor_handle: WeakEntity<Editor>,
         avatar_size: Pixels,
         action_icon_size: IconSize,
         colors: &theme::ThemeColors,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         let comment_id = comment.id;
         let author = comment.author.clone();
         let created_at = comment.created_at.clone();
@@ -4984,11 +5277,14 @@ impl Editor {
 
         v_flex()
             .w_full()
+            .min_w_0()
             .gap_1()
             .child(
                 h_flex()
                     .w_full()
-                    .items_center()
+                    .min_w_0()
+                    .relative()
+                    .items_start()
                     .gap_2()
                     .px_2()
                     .py_1p5()
@@ -4996,9 +5292,19 @@ impl Editor {
                     .border_1()
                     .border_color(review_comment_border)
                     .bg(review_comment_background)
-                    .child(Self::render_author_badge(author, avatar_size, colors))
+                    .child(if is_editing {
+                        Self::render_author_badge(author, avatar_size, colors).into_any_element()
+                    } else {
+                        div()
+                            .absolute()
+                            .top_1()
+                            .left_2()
+                            .child(Self::render_author_badge(author, avatar_size, colors))
+                            .into_any_element()
+                    })
                     .child(if let Some(editor) = inline_editor {
                         div()
+                            .min_w_0()
                             .flex_1()
                             .border_1()
                             .border_color(colors.border)
@@ -5010,18 +5316,23 @@ impl Editor {
                             .into_any_element()
                     } else {
                         div()
+                            .min_w_0()
                             .flex_1()
-                            .text_sm()
-                            .text_color(colors.text)
-                            .child(Self::render_review_comment_body(
-                                comment.comment,
-                                body_editor_handle,
-                                colors,
-                            ))
+                            .pt(px(28.))
+                            .child(if let Some(body_editor) = body_editor {
+                                body_editor.into_any_element()
+                            } else {
+                                Self::render_review_comment_body(
+                                    comment.comment,
+                                    body_editor_handle,
+                                    colors,
+                                )
+                            })
                             .into_any_element()
                     })
                     .child(if is_editing {
                         h_flex()
+                            .flex_shrink_0()
                             .gap_1()
                             .child(
                                 IconButton::new(
@@ -5063,6 +5374,10 @@ impl Editor {
                             .into_any_element()
                     } else {
                         h_flex()
+                            .absolute()
+                            .top_1()
+                            .right_2()
+                            .flex_shrink_0()
                             .gap_1()
                             .when_some(created_at, |el, created_at| {
                                 let mut timestamp = div().child(
@@ -5172,9 +5487,12 @@ impl Editor {
                 let cancel_reply_edit_handle = reply_row_editor_handle.clone();
                 let confirm_reply_edit_handle = reply_row_editor_handle.clone();
                 let reply_body_editor_handle = reply_row_editor_handle.clone();
+                let reply_body_editor = reply_body_editors.get(&reply_id).cloned();
                 h_flex()
                     .ml_4()
-                    .items_center()
+                    .min_w_0()
+                    .relative()
+                    .items_start()
                     .gap_2()
                     .px_2()
                     .py_1p5()
@@ -5182,9 +5500,20 @@ impl Editor {
                     .border_1()
                     .border_color(review_comment_border)
                     .bg(review_comment_background)
-                    .child(Self::render_author_badge(reply.author, avatar_size, colors))
+                    .child(if is_editing_reply {
+                        Self::render_author_badge(reply.author, avatar_size, colors)
+                            .into_any_element()
+                    } else {
+                        div()
+                            .absolute()
+                            .top_1()
+                            .left_2()
+                            .child(Self::render_author_badge(reply.author, avatar_size, colors))
+                            .into_any_element()
+                    })
                     .child(if let Some(editor) = inline_reply_editor {
                         div()
+                            .min_w_0()
                             .flex_1()
                             .border_1()
                             .border_color(colors.border)
@@ -5196,18 +5525,23 @@ impl Editor {
                             .into_any_element()
                     } else {
                         div()
+                            .min_w_0()
                             .flex_1()
-                            .text_sm()
-                            .text_color(colors.text)
-                            .child(Self::render_review_comment_body(
-                                reply.comment,
-                                reply_body_editor_handle,
-                                colors,
-                            ))
+                            .pt(px(28.))
+                            .child(if let Some(reply_body_editor) = reply_body_editor {
+                                reply_body_editor.into_any_element()
+                            } else {
+                                Self::render_review_comment_body(
+                                    reply.comment,
+                                    reply_body_editor_handle,
+                                    colors,
+                                )
+                            })
                             .into_any_element()
                     })
                     .child(if is_editing_reply {
                         h_flex()
+                            .flex_shrink_0()
                             .gap_1()
                             .child(
                                 IconButton::new(
@@ -5246,6 +5580,10 @@ impl Editor {
                             .into_any_element()
                     } else {
                         h_flex()
+                            .absolute()
+                            .top_1()
+                            .right_2()
+                            .flex_shrink_0()
                             .gap_1()
                             .when_some(reply.created_at, |el, created_at| {
                                 let mut timestamp = div().child(
@@ -5340,7 +5678,8 @@ impl Editor {
                 el.child(
                     h_flex()
                         .ml_4()
-                        .items_center()
+                        .min_w_0()
+                        .items_start()
                         .gap_2()
                         .px_2()
                         .py_1p5()
@@ -5353,6 +5692,7 @@ impl Editor {
                         ))
                         .child(
                             div()
+                                .min_w_0()
                                 .flex_1()
                                 .border_1()
                                 .border_color(colors.border)
@@ -5364,6 +5704,7 @@ impl Editor {
                         )
                         .child(
                             h_flex()
+                                .flex_shrink_0()
                                 .gap_1()
                                 .child(
                                     IconButton::new(
@@ -5414,6 +5755,7 @@ impl Editor {
                         ),
                 )
             })
+            .into_any_element()
     }
 
     fn render_review_comment_body(
@@ -5426,9 +5768,25 @@ impl Editor {
         let background = colors.element_background;
 
         v_flex()
+            .w_full()
+            .min_w_0()
             .gap_0p5()
             .children(parse_review_comment_body(&comment).into_iter().map(|line| {
+                if let [ReviewCommentBodySegment::Text(text)] = line.as_slice() {
+                    return div()
+                        .w_full()
+                        .min_w_0()
+                        .text_sm()
+                        .text_color(text_color)
+                        .whitespace_normal()
+                        .child(text.clone())
+                        .into_any_element();
+                }
+
                 h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .flex_wrap()
                     .items_center()
                     .gap_1()
                     .children(line.into_iter().map(|segment| {
@@ -5436,6 +5794,7 @@ impl Editor {
                             ReviewCommentBodySegment::Text(text) => div()
                                 .text_sm()
                                 .text_color(text_color)
+                                .whitespace_normal()
                                 .child(text)
                                 .into_any_element(),
                             ReviewCommentBodySegment::Mention(mention) => {
@@ -5448,6 +5807,7 @@ impl Editor {
                             }
                         }
                     }))
+                    .into_any_element()
             }))
             .into_any_element()
     }
@@ -5461,9 +5821,15 @@ impl Editor {
         let label = mention.label;
         let url = mention.url;
         let tooltip = mention.tooltip;
+        let label = if mention.show_at_prefix {
+            format!("@{label}")
+        } else {
+            label
+        };
 
         let chip = h_flex()
             .id(format!("diff-review-mention-{url}"))
+            .flex_shrink_0()
             .items_center()
             .gap_1()
             .h_5()
@@ -5478,7 +5844,7 @@ impl Editor {
                     .size(IconSize::XSmall)
                     .color(ui::Color::Muted),
             )
-            .child(Label::new(format!("@{label}")).size(LabelSize::Small))
+            .child(Label::new(label).size(LabelSize::Small))
             .on_click(move |_, window, cx| {
                 if let Some(editor) = editor_handle.upgrade() {
                     editor.update(cx, |editor, cx| {
@@ -5568,18 +5934,32 @@ impl Editor {
         avatar_size: Pixels,
         colors: &theme::ThemeColors,
     ) -> impl IntoElement {
+        let is_amp = author.eq_ignore_ascii_case("amp");
+        let is_vxio = author.eq_ignore_ascii_case("vxio");
+
         div()
             .min_w(px(36.))
             .h(avatar_size)
-            .px_1()
+            .px_1p5()
             .flex()
             .items_center()
+            .gap_1()
             .justify_center()
             .flex_shrink_0()
             .rounded_full()
             .border_1()
             .border_color(colors.border)
             .bg(colors.editor_background)
+            .child(if is_amp {
+                Label::new("🤖").size(LabelSize::XSmall).into_any_element()
+            } else if is_vxio {
+                Label::new("🤠").size(LabelSize::XSmall).into_any_element()
+            } else {
+                Icon::new(IconName::Person)
+                    .size(IconSize::XSmall)
+                    .color(ui::Color::Muted)
+                    .into_any_element()
+            })
             .child(
                 Label::new(author)
                     .size(LabelSize::XSmall)

@@ -232,6 +232,7 @@ function sign_app_binaries() {
             echo "Opening /Applications/$bundle_name"
             open "/Applications/$bundle_name"
         fi
+        return 0
     elif [ "$open_result" = true ]; then
         open "$app_path"
     fi
