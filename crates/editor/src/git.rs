@@ -3714,6 +3714,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let hunk_key = self.hunk_key_for_review_comment(comment_id);
+        self.set_comment_editing(comment_id, false, cx);
 
         if let Some(hunk_key) = hunk_key {
             let snapshot = self.buffer.read(cx).snapshot(cx);
@@ -3727,8 +3728,6 @@ impl Editor {
             }
             self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
         }
-
-        self.set_comment_editing(comment_id, false, cx);
     }
 
     pub(super) fn confirm_edit_review_reply(
@@ -3779,6 +3778,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let hunk_key = self.hunk_key_for_review_reply(reply_id);
+        self.set_reply_editing(reply_id, false, cx);
 
         if let Some(hunk_key) = hunk_key {
             let snapshot = self.buffer.read(cx).snapshot(cx);
@@ -3792,8 +3792,6 @@ impl Editor {
             }
             self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
         }
-
-        self.set_reply_editing(reply_id, false, cx);
     }
 
     /// Action handler for ConfirmEditReviewComment.

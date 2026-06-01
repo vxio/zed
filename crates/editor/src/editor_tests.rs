@@ -41757,6 +41757,7 @@ fn test_diff_review_inline_edit_cancel_keeps_comment(cx: &mut TestAppContext) {
 
     inline_editor.update_in(cx, |inline_editor, window, cx| {
         inline_editor.cancel(&crate::actions::Cancel, window, cx);
+        inline_editor.cancel(&crate::actions::Cancel, window, cx);
     });
 
     editor
@@ -41769,6 +41770,7 @@ fn test_diff_review_inline_edit_cancel_keeps_comment(cx: &mut TestAppContext) {
             assert_eq!(comment.comment, "Original comment");
             assert!(!comment.is_editing);
             assert!(overlay.inline_edit_editors.is_empty());
+            assert!(overlay.body_editors.contains_key(&comment.id));
         })
         .unwrap();
 }
@@ -42224,7 +42226,7 @@ fn test_calculate_overlay_height(cx: &mut TestAppContext) {
         };
 
         // No comments: base height of 2
-        let height_no_comments = editor.calculate_overlay_height(&key, true, true, &snapshot);
+        let height_no_comments = editor.calculate_overlay_height(&key, true, true, &snapshot, cx);
         assert_eq!(
             height_no_comments, 2,
             "Base height should be 2 with no comments"
@@ -42236,7 +42238,7 @@ fn test_calculate_overlay_height(cx: &mut TestAppContext) {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
 
         // With comments expanded: base (2) + header (1) + 2 per comment
-        let height_expanded = editor.calculate_overlay_height(&key, true, true, &snapshot);
+        let height_expanded = editor.calculate_overlay_height(&key, true, true, &snapshot, cx);
         assert_eq!(
             height_expanded,
             2 + 1 + 2, // base + header + 1 comment * 2
@@ -42244,7 +42246,7 @@ fn test_calculate_overlay_height(cx: &mut TestAppContext) {
         );
 
         // With comments collapsed: base (2) + header (1)
-        let height_collapsed = editor.calculate_overlay_height(&key, false, true, &snapshot);
+        let height_collapsed = editor.calculate_overlay_height(&key, false, true, &snapshot, cx);
         assert_eq!(
             height_collapsed,
             2 + 1, // base + header only
@@ -42258,7 +42260,7 @@ fn test_calculate_overlay_height(cx: &mut TestAppContext) {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
 
         // With 3 comments expanded
-        let height_3_expanded = editor.calculate_overlay_height(&key, true, true, &snapshot);
+        let height_3_expanded = editor.calculate_overlay_height(&key, true, true, &snapshot, cx);
         assert_eq!(
             height_3_expanded,
             2 + 1 + (3 * 2), // base + header + 3 comments * 2
@@ -42266,7 +42268,7 @@ fn test_calculate_overlay_height(cx: &mut TestAppContext) {
         );
 
         // Collapsed height stays the same regardless of comment count
-        let height_3_collapsed = editor.calculate_overlay_height(&key, false, true, &snapshot);
+        let height_3_collapsed = editor.calculate_overlay_height(&key, false, true, &snapshot, cx);
         assert_eq!(
             height_3_collapsed,
             2 + 1, // base + header only
