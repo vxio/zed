@@ -339,10 +339,13 @@ pub(super) struct StoredReviewComment {
     pub(super) id: usize,
     pub(super) author: String,
     pub(super) created_at: Option<String>,
+    pub(super) deleted_on: Option<String>,
     pub(super) comment: String,
     pub(super) range: Range<Anchor>,
     pub(super) replies: Vec<StoredReviewReply>,
     pub(super) is_editing: bool,
+    pub(super) outdated: bool,
+    pub(super) outdated_reason: Option<String>,
     location: ReviewCommentLocation,
 }
 
@@ -468,6 +471,8 @@ pub(super) struct ReviewCommentSnapshot {
     author: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deleted_on: Option<String>,
     file: String,
     side: String,
     hunk_line: u32,
@@ -1529,10 +1534,13 @@ impl StoredReviewComment {
             id,
             author,
             created_at: current_review_comment_timestamp(),
+            deleted_on: None,
             comment,
             range: anchor_range,
             replies,
             is_editing: false,
+            outdated: false,
+            outdated_reason: None,
             location,
         }
     }
@@ -1557,6 +1565,13 @@ impl Editor {
             editor.set_text(comment.clone(), window, cx);
             editor.set_read_only(true);
             editor.set_use_modal_editing(false);
+            let selection_color = cx.theme().colors().text_accent;
+            editor.set_read_only_player_color(Some(PlayerColor {
+                cursor: selection_color,
+                background: selection_color.opacity(0.45),
+                selection: selection_color.opacity(0.85),
+            }));
+            editor.set_cursor_shape(CursorShape::Block, cx);
             editor.set_show_gutter(false, cx);
             editor.set_show_line_numbers(false, cx);
             editor.set_show_git_diff_gutter(false, cx);
@@ -1608,6 +1623,35 @@ impl Editor {
             Self::focus_review_comment_editor(&editor, window, cx);
         })
         .detach();
+    }
+
+    fn review_comment_prompt_focus_out_subscription(
+        hunk_key: DiffHunkKey,
+        prompt_editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        let focus_handle = prompt_editor.focus_handle(cx);
+        cx.on_focus_out(&focus_handle, window, move |editor, _, window, cx| {
+            editor.dismiss_empty_diff_review_prompt(&hunk_key, window, cx);
+        })
+    }
+
+    fn review_comment_enter_subscription(
+        editor: &Entity<Editor>,
+        cx: &mut Context<Self>,
+        mut confirm: impl FnMut(&mut Window, &mut App) + 'static,
+    ) -> Subscription {
+        let focus_handle = editor.focus_handle(cx);
+        cx.intercept_keystrokes(move |event, window, cx| {
+            if event.keystroke.key == "enter"
+                && !event.keystroke.modifiers.modified()
+                && focus_handle.contains_focused(window, cx)
+            {
+                confirm(window, cx);
+                cx.stop_propagation();
+            }
+        })
     }
 
     fn insert_review_mention_crease(
@@ -1737,32 +1781,6 @@ impl Editor {
             format!("zed-review:comment:{id}")
         };
         cx.write_to_clipboard(ClipboardItem::new_string(reference));
-    }
-
-    pub(super) fn confirm_delete_review_comment(
-        &mut self,
-        id: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let prompt = window.prompt(
-            PromptLevel::Warning,
-            "Delete review comment?",
-            Some("This removes the comment from the current review."),
-            &["Delete", "Cancel"],
-            cx,
-        );
-        let editor = cx.entity().downgrade();
-        cx.spawn_in(window, async move |_, cx| {
-            if prompt.await == Ok(0) {
-                editor
-                    .update_in(cx, |editor, window, cx| {
-                        editor.delete_review_comment(&DeleteReviewComment { id }, window, cx);
-                    })
-                    .ok();
-            }
-        })
-        .detach();
     }
 
     pub(super) fn confirm_delete_review_reply(
@@ -2236,8 +2254,24 @@ impl Editor {
         Self::install_review_comment_insert_mode_handler(&prompt_editor, window, cx);
 
         let parent_editor = cx.entity().downgrade();
+        let enter_subscription = Self::review_comment_enter_subscription(&prompt_editor, cx, {
+            let parent_editor = parent_editor.clone();
+            move |window, cx| {
+                if let Some(editor) = parent_editor.upgrade() {
+                    editor.update(cx, |editor, cx| {
+                        editor.submit_diff_review_comment(window, cx);
+                    });
+                }
+            }
+        });
+        let focus_out_subscription = Self::review_comment_prompt_focus_out_subscription(
+            hunk_key.clone(),
+            &prompt_editor,
+            window,
+            cx,
+        );
         let subscription = prompt_editor.update(cx, |prompt_editor, _cx| {
-            prompt_editor.register_action({
+            let confirm_subscription = prompt_editor.register_action({
                 let parent_editor = parent_editor.clone();
                 move |_: &menu::Confirm, window, cx| {
                     if let Some(editor) = parent_editor.upgrade() {
@@ -2246,7 +2280,25 @@ impl Editor {
                         });
                     }
                 }
-            })
+            });
+            let cancel_subscription = prompt_editor.register_action({
+                let parent_editor = parent_editor.clone();
+                let hunk_key = hunk_key.clone();
+                move |_: &crate::actions::Cancel, window, cx| {
+                    if let Some(editor) = parent_editor.upgrade() {
+                        editor.update(cx, |editor, cx| {
+                            editor.dismiss_diff_review_prompt(&hunk_key, window, cx);
+                        });
+                    }
+                }
+            });
+            Subscription::join(
+                Subscription::join(
+                    Subscription::join(confirm_subscription, cancel_subscription),
+                    enter_subscription,
+                ),
+                focus_out_subscription,
+            )
         });
 
         let initial_height =
@@ -2392,12 +2444,93 @@ impl Editor {
     }
 
     pub(super) fn total_review_comment_count(&self) -> usize {
-        self.orphaned_review_comments.len()
+        self.orphaned_review_comments
+            .iter()
+            .filter(|comment| comment.deleted_on.is_none())
+            .count()
             + self
                 .stored_review_comments
                 .iter()
-                .map(|(_, v)| v.len())
+                .map(|(_, comments)| {
+                    comments
+                        .iter()
+                        .filter(|comment| comment.deleted_on.is_none())
+                        .count()
+                })
                 .sum::<usize>()
+    }
+
+    pub(super) fn refresh_review_comment_outdated_markers(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let mut changed = false;
+        let stale_reasons = self
+            .stored_review_comments
+            .iter()
+            .map(|(key, comments)| {
+                comments
+                    .iter()
+                    .map(|comment| Self::outdated_review_comment_reason(key, comment, &snapshot))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        for ((_, comments), reasons) in self.stored_review_comments.iter_mut().zip(stale_reasons) {
+            for (comment, reason) in comments.iter_mut().zip(reasons) {
+                let outdated = reason.is_some();
+                if comment.outdated != outdated || comment.outdated_reason != reason {
+                    comment.outdated = outdated;
+                    comment.outdated_reason = reason;
+                    changed = true;
+                }
+            }
+        }
+
+        if changed {
+            cx.emit(EditorEvent::ReviewCommentsChanged {
+                total_count: self.total_review_comment_count(),
+                persist: true,
+            });
+            cx.notify();
+        }
+
+        changed
+    }
+
+    fn outdated_review_comment_reason(
+        key: &DiffHunkKey,
+        comment: &StoredReviewComment,
+        snapshot: &MultiBufferSnapshot,
+    ) -> Option<String> {
+        let file_has_visible_diff = snapshot
+            .buffers_with_paths()
+            .any(|(_, path_key)| path_key.path == key.file_path);
+        if !file_has_visible_diff {
+            return Some("file_not_in_diff".to_string());
+        }
+
+        if !comment.range.start.is_valid(snapshot) || !comment.range.end.is_valid(snapshot) {
+            return Some("line_not_in_diff".to_string());
+        }
+
+        let start = comment.range.start.to_point(snapshot);
+        let end = comment.range.end.to_point(snapshot);
+        let query_end = if end.row < snapshot.max_point().row {
+            Point::new(end.row + 1, 0)
+        } else {
+            snapshot.max_point()
+        };
+        let has_hunk = snapshot.diff_hunks_in_range(start..query_end).any(|hunk| {
+            snapshot
+                .buffers_with_paths()
+                .any(|(buffer_snapshot, path_key)| {
+                    buffer_snapshot.remote_id() == hunk.buffer_id && path_key.path == key.file_path
+                })
+        });
+
+        (!has_hunk).then(|| "line_not_in_diff".to_string())
     }
 
     pub(super) fn add_review_comment(
@@ -2684,6 +2817,112 @@ impl Editor {
         self.show_diff_review_overlay(row..row, window, cx);
     }
 
+    pub(super) fn go_to_next_review_comment_thread(
+        &mut self,
+        _: &NextCommentThread,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.go_to_review_comment_thread(Direction::Next, window, cx);
+    }
+
+    pub(super) fn go_to_previous_review_comment_thread(
+        &mut self,
+        _: &PreviousCommentThread,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.go_to_review_comment_thread(Direction::Prev, window, cx);
+    }
+
+    fn go_to_review_comment_thread(
+        &mut self,
+        direction: Direction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.snapshot(window, cx);
+        let current_position = self
+            .selections
+            .newest::<Point>(&snapshot.display_snapshot)
+            .head();
+        let buffer_snapshot = snapshot.buffer_snapshot();
+        let threads = self.review_comment_thread_positions(&buffer_snapshot);
+        let Some((_, destination, hunk_key)) =
+            Self::review_comment_thread_after_or_before(&threads, current_position, direction)
+        else {
+            return;
+        };
+
+        self.unfold_ranges(&[destination..destination], false, false, cx);
+        self.change_selections(
+            SelectionEffects::scroll(Autoscroll::center()),
+            window,
+            cx,
+            |s| {
+                s.select_ranges([destination..destination]);
+            },
+        );
+
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        if let Some(overlay) = self
+            .diff_review_overlays
+            .iter_mut()
+            .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
+        {
+            overlay.comments_expanded = true;
+            self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        }
+    }
+
+    fn review_comment_thread_positions(
+        &self,
+        snapshot: &MultiBufferSnapshot,
+    ) -> Vec<(usize, Point, DiffHunkKey)> {
+        let mut threads = Vec::new();
+
+        for (hunk_key, comments) in &self.stored_review_comments {
+            for comment in comments {
+                if comment.deleted_on.is_none() && comment.range.start.is_valid(snapshot) {
+                    threads.push((
+                        comment.id,
+                        comment.range.start.to_point(snapshot),
+                        hunk_key.clone(),
+                    ));
+                }
+            }
+        }
+
+        threads.sort_by_key(|(id, point, _)| (point.row, point.column, *id));
+        threads
+    }
+
+    fn review_comment_thread_after_or_before(
+        threads: &[(usize, Point, DiffHunkKey)],
+        position: Point,
+        direction: Direction,
+    ) -> Option<(usize, Point, DiffHunkKey)> {
+        match direction {
+            Direction::Next => threads
+                .iter()
+                .find(|(_, point, _)| {
+                    point.row > position.row
+                        || point.row == position.row && point.column > position.column
+                })
+                .or_else(|| threads.first())
+                .cloned(),
+            Direction::Prev => threads
+                .iter()
+                .rev()
+                .find(|(_, point, _)| {
+                    point.row < position.row
+                        || point.row == position.row && point.column < position.column
+                })
+                .or_else(|| threads.last())
+                .cloned(),
+        }
+    }
+
     pub(super) fn render_diff_review_button(
         &self,
         display_row: DisplayRow,
@@ -2809,6 +3048,57 @@ impl Editor {
         }
     }
 
+    pub(super) fn dismiss_empty_diff_review_prompt(
+        &mut self,
+        hunk_key: &DiffHunkKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let Some(overlay_index) = self
+            .diff_review_overlays
+            .iter()
+            .position(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, &snapshot))
+        else {
+            return false;
+        };
+
+        let overlay = &self.diff_review_overlays[overlay_index];
+        if !overlay.prompt_visible || !overlay.prompt_editor.read(cx).text(cx).trim().is_empty() {
+            return false;
+        }
+
+        self.dismiss_diff_review_prompt(hunk_key, window, cx);
+        true
+    }
+
+    pub(super) fn dismiss_focused_diff_review_prompt(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let hunk_key = self
+            .diff_review_overlays
+            .iter()
+            .find(|overlay| {
+                overlay.prompt_visible && overlay.prompt_editor.focus_handle(cx).is_focused(window)
+            })
+            .map(|overlay| overlay.hunk_key.clone());
+        if let Some(hunk_key) = hunk_key {
+            self.dismiss_diff_review_prompt(&hunk_key, window, cx);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn has_visible_review_comments(&self, cx: &App) -> bool {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        self.diff_review_overlays
+            .iter()
+            .any(|overlay| self.hunk_comment_count(&overlay.hunk_key, &snapshot) > 0)
+    }
+
     /// Action handler for SubmitDiffReviewComment.
     pub(super) fn submit_diff_review_comment_action(
         &mut self,
@@ -2820,19 +3110,25 @@ impl Editor {
     }
 
     /// Returns comments for a specific hunk, ordered by creation time.
-    pub(super) fn comments_for_hunk<'a>(
-        &'a self,
+    pub(super) fn comments_for_hunk(
+        &self,
         key: &DiffHunkKey,
         snapshot: &MultiBufferSnapshot,
-    ) -> &'a [StoredReviewComment] {
+    ) -> Vec<StoredReviewComment> {
         let key_point = key.hunk_start_anchor.to_point(snapshot);
         self.stored_review_comments
             .iter()
             .find(|(k, _)| {
                 k.file_path == key.file_path && k.hunk_start_anchor.to_point(snapshot) == key_point
             })
-            .map(|(_, comments)| comments.as_slice())
-            .unwrap_or(&[])
+            .map(|(_, comments)| {
+                comments
+                    .iter()
+                    .filter(|comment| comment.deleted_on.is_none())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Returns the count of comments for a specific hunk.
@@ -2847,7 +3143,12 @@ impl Editor {
             .find(|(k, _)| {
                 k.file_path == key.file_path && k.hunk_start_anchor.to_point(snapshot) == key_point
             })
-            .map(|(_, v)| v.len())
+            .map(|(_, comments)| {
+                comments
+                    .iter()
+                    .filter(|comment| comment.deleted_on.is_none())
+                    .count()
+            })
             .unwrap_or(0)
     }
 
@@ -2858,7 +3159,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let comments = self.comments_for_hunk(hunk_key, &snapshot).to_vec();
+        let comments = self.comments_for_hunk(hunk_key, &snapshot);
         let Some(overlay_index) = self
             .diff_review_overlays
             .iter()
@@ -2998,12 +3299,20 @@ impl Editor {
     }
 
     pub(super) fn remove_review_comment(&mut self, id: usize, cx: &mut Context<Self>) -> bool {
-        if let Some(index) = self
+        if let Some(comment) = self
             .orphaned_review_comments
             .iter()
-            .position(|comment| comment.id == id)
+            .find(|comment| comment.id == id)
+            && comment.deleted_on.is_some()
         {
-            self.orphaned_review_comments.remove(index);
+            return false;
+        }
+        if let Some(comment) = self
+            .orphaned_review_comments
+            .iter_mut()
+            .find(|comment| comment.id == id)
+        {
+            comment.deleted_on = current_review_comment_timestamp();
             cx.emit(EditorEvent::ReviewCommentsChanged {
                 total_count: self.total_review_comment_count(),
                 persist: true,
@@ -3013,8 +3322,11 @@ impl Editor {
         }
 
         for (_, comments) in self.stored_review_comments.iter_mut() {
-            if let Some(index) = comments.iter().position(|c| c.id == id) {
-                comments.remove(index);
+            if let Some(comment) = comments.iter_mut().find(|comment| comment.id == id) {
+                if comment.deleted_on.is_some() {
+                    return false;
+                }
+                comment.deleted_on = current_review_comment_timestamp();
                 cx.emit(EditorEvent::ReviewCommentsChanged {
                     total_count: self.total_review_comment_count(),
                     persist: true,
@@ -3024,6 +3336,92 @@ impl Editor {
             }
         }
         false
+    }
+
+    pub(super) fn restore_latest_deleted_review_comment(
+        &mut self,
+        _: &RestoreLatestDeletedComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut latest_deleted: Option<(String, usize)> = None;
+
+        for comment in &self.orphaned_review_comments {
+            if let Some(deleted_on) = &comment.deleted_on
+                && latest_deleted
+                    .as_ref()
+                    .is_none_or(|latest| (deleted_on, comment.id) > (&latest.0, latest.1))
+            {
+                latest_deleted = Some((deleted_on.clone(), comment.id));
+            }
+        }
+
+        for (_, comments) in &self.stored_review_comments {
+            for comment in comments {
+                if let Some(deleted_on) = &comment.deleted_on
+                    && latest_deleted
+                        .as_ref()
+                        .is_none_or(|latest| (deleted_on, comment.id) > (&latest.0, latest.1))
+                {
+                    latest_deleted = Some((deleted_on.clone(), comment.id));
+                }
+            }
+        }
+
+        let Some((_, comment_id)) = latest_deleted else {
+            return;
+        };
+
+        if let Some(comment) = self
+            .orphaned_review_comments
+            .iter_mut()
+            .find(|comment| comment.id == comment_id)
+        {
+            comment.deleted_on = None;
+            cx.emit(EditorEvent::ReviewCommentsChanged {
+                total_count: self.total_review_comment_count(),
+                persist: true,
+            });
+            cx.notify();
+            return;
+        }
+
+        let mut restored_hunk_key = None;
+        for (hunk_key, comments) in self.stored_review_comments.iter_mut() {
+            if let Some(comment) = comments.iter_mut().find(|comment| comment.id == comment_id) {
+                comment.deleted_on = None;
+                restored_hunk_key = Some(hunk_key.clone());
+                break;
+            }
+        }
+
+        if let Some(hunk_key) = restored_hunk_key {
+            let display_snapshot = self.display_snapshot(cx);
+            let snapshot = self.buffer.read(cx).snapshot(cx);
+            let display_range = self
+                .stored_review_comments
+                .iter()
+                .find(|(key, _)| Self::hunk_keys_match(key, &hunk_key, &snapshot))
+                .and_then(|(_, comments)| comments.iter().find(|comment| comment.id == comment_id))
+                .map(|comment| {
+                    let start = comment
+                        .range
+                        .start
+                        .to_display_point(&display_snapshot)
+                        .row();
+                    let end = comment.range.end.to_display_point(&display_snapshot).row();
+                    start..end
+                });
+            if let Some(display_range) = display_range {
+                self.show_diff_review_overlay_with_prompt(display_range, false, window, cx);
+            }
+            self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+            cx.emit(EditorEvent::ReviewCommentsChanged {
+                total_count: self.total_review_comment_count(),
+                persist: true,
+            });
+            cx.notify();
+        }
     }
 
     pub(super) fn remove_review_reply(&mut self, id: usize, cx: &mut Context<Self>) -> bool {
@@ -3144,18 +3542,31 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.review_comments_json(cx) {
+        match self.active_review_comments_json(cx) {
             Ok(json) => cx.write_to_clipboard(ClipboardItem::new_string(json)),
             Err(error) => log::error!("failed to serialize review comments: {error:#}"),
         }
     }
 
     pub fn review_comments_json(&self, _cx: &App) -> anyhow::Result<String> {
+        self.review_comments_json_with_deleted(true)
+    }
+
+    fn active_review_comments_json(&self, _cx: &App) -> anyhow::Result<String> {
+        self.review_comments_json_with_deleted(false)
+    }
+
+    fn review_comments_json_with_deleted(&self, include_deleted: bool) -> anyhow::Result<String> {
         let mut comments = self.orphaned_review_comments.clone();
+        if !include_deleted {
+            comments.retain(|comment| comment.deleted_on.is_none());
+        }
 
         for (_, hunk_comments) in &self.stored_review_comments {
             for comment in hunk_comments {
-                comments.push(Self::review_comment_snapshot(comment));
+                if include_deleted || comment.deleted_on.is_none() {
+                    comments.push(Self::review_comment_snapshot(comment));
+                }
             }
         }
 
@@ -3216,14 +3627,15 @@ impl Editor {
             id: comment.id,
             author: comment.author.clone(),
             created_at: comment.created_at.clone(),
+            deleted_on: comment.deleted_on.clone(),
             file: location.file,
             side: location.side,
             hunk_line: location.hunk_line,
             line_start: location.line_start,
             line_end: location.line_end,
             body: comment.comment.clone(),
-            outdated: false,
-            outdated_reason: None,
+            outdated: comment.outdated,
+            outdated_reason: comment.outdated_reason.clone(),
             replies: comment
                 .replies
                 .iter()
@@ -3343,6 +3755,9 @@ impl Editor {
             );
             let comment = StoredReviewComment {
                 created_at: saved_comment.created_at,
+                deleted_on: saved_comment.deleted_on,
+                outdated: saved_comment.outdated,
+                outdated_reason: saved_comment.outdated_reason,
                 ..comment
             };
 
@@ -3361,7 +3776,12 @@ impl Editor {
         let restored_ranges: Vec<_> = self
             .stored_review_comments
             .iter()
-            .filter_map(|(_, comments)| comments.first().map(|comment| comment.range.clone()))
+            .filter_map(|(_, comments)| {
+                comments
+                    .iter()
+                    .find(|comment| comment.deleted_on.is_none())
+                    .map(|comment| comment.range.clone())
+            })
             .collect();
         for range in restored_ranges {
             let display_snapshot = self.display_snapshot(cx);
@@ -3472,6 +3892,17 @@ impl Editor {
                     );
                     Self::install_review_comment_insert_mode_handler(&inline_editor, window, cx);
 
+                    let enter_subscription =
+                        Self::review_comment_enter_subscription(&inline_editor, cx, {
+                            let parent_editor = parent_editor.clone();
+                            move |window, cx| {
+                                if let Some(editor) = parent_editor.upgrade() {
+                                    editor.update(cx, |editor, cx| {
+                                        editor.confirm_edit_review_comment(comment_id, window, cx);
+                                    });
+                                }
+                            }
+                        });
                     let subscription = inline_editor.update(cx, |inline_editor, _cx| {
                         let confirm_subscription = inline_editor.register_action({
                             let parent_editor = parent_editor.clone();
@@ -3493,7 +3924,10 @@ impl Editor {
                                 }
                             }
                         });
-                        Subscription::join(confirm_subscription, cancel_subscription)
+                        Subscription::join(
+                            Subscription::join(confirm_subscription, cancel_subscription),
+                            enter_subscription,
+                        )
                     });
 
                     overlay
@@ -3547,6 +3981,16 @@ impl Editor {
             Self::attach_review_comment_completion_provider(completion_project, &reply_editor, cx);
             Self::install_review_comment_insert_mode_handler(&reply_editor, window, cx);
 
+            let enter_subscription = Self::review_comment_enter_subscription(&reply_editor, cx, {
+                let parent_editor = parent_editor.clone();
+                move |window, cx| {
+                    if let Some(editor) = parent_editor.upgrade() {
+                        editor.update(cx, |editor, cx| {
+                            editor.submit_review_reply(comment_id, window, cx);
+                        });
+                    }
+                }
+            });
             let subscription = reply_editor.update(cx, |reply_editor, _cx| {
                 let submit_subscription = reply_editor.register_action({
                     let parent_editor = parent_editor.clone();
@@ -3568,7 +4012,10 @@ impl Editor {
                         }
                     }
                 });
-                Subscription::join(submit_subscription, cancel_subscription)
+                Subscription::join(
+                    Subscription::join(submit_subscription, cancel_subscription),
+                    enter_subscription,
+                )
             });
 
             overlay.reply_subscriptions.insert(comment_id, subscription);
@@ -3935,6 +4382,17 @@ impl Editor {
                     );
                     Self::install_review_comment_insert_mode_handler(&inline_editor, window, cx);
 
+                    let enter_subscription =
+                        Self::review_comment_enter_subscription(&inline_editor, cx, {
+                            let parent_editor = parent_editor.clone();
+                            move |window, cx| {
+                                if let Some(editor) = parent_editor.upgrade() {
+                                    editor.update(cx, |editor, cx| {
+                                        editor.confirm_edit_review_reply(reply_id, window, cx);
+                                    });
+                                }
+                            }
+                        });
                     let subscription = inline_editor.update(cx, |inline_editor, _cx| {
                         let confirm_subscription = inline_editor.register_action({
                             let parent_editor = parent_editor.clone();
@@ -3956,7 +4414,10 @@ impl Editor {
                                 }
                             }
                         });
-                        Subscription::join(confirm_subscription, cancel_subscription)
+                        Subscription::join(
+                            Subscription::join(confirm_subscription, cancel_subscription),
+                            enter_subscription,
+                        )
                     });
 
                     overlay
@@ -4812,23 +5273,25 @@ impl Editor {
     fn dismiss_overlays_without_comments(&mut self, cx: &mut Context<Self>) {
         let snapshot = self.buffer.read(cx).snapshot(cx);
 
-        // First, compute which overlays have comments (to avoid borrow issues with retain)
-        let overlays_with_comments: Vec<bool> = self
+        let overlays_to_keep: Vec<bool> = self
             .diff_review_overlays
             .iter()
-            .map(|overlay| self.hunk_comment_count(&overlay.hunk_key, &snapshot) > 0)
+            .map(|overlay| {
+                self.hunk_comment_count(&overlay.hunk_key, &snapshot) > 0
+                    || (overlay.prompt_visible
+                        && !overlay.prompt_editor.read(cx).text(cx).trim().is_empty())
+            })
             .collect();
 
-        // Now collect block IDs to remove and retain overlays
         let mut block_ids_to_remove = HashSet::default();
         let mut index = 0;
         self.diff_review_overlays.retain(|overlay| {
-            let has_comments = overlays_with_comments[index];
+            let should_keep = overlays_to_keep[index];
             index += 1;
-            if !has_comments {
+            if !should_keep {
                 block_ids_to_remove.insert(overlay.block_id);
             }
-            has_comments
+            should_keep
         });
 
         if !block_ids_to_remove.is_empty() {
@@ -4949,7 +5412,7 @@ impl Editor {
             .map(|editor| {
                 let editor = editor.read(cx);
                 let snapshot = editor.buffer().read(cx).snapshot(cx);
-                let comments = editor.comments_for_hunk(hunk_key, &snapshot).to_vec();
+                let comments = editor.comments_for_hunk(hunk_key, &snapshot);
                 let (
                     expanded,
                     prompt_visible,
@@ -5067,6 +5530,19 @@ impl Editor {
                         .py_1p5()
                         .rounded_md()
                         .bg(colors.surface_background)
+                        .on_mouse_down_out({
+                            let editor_handle = editor_handle.clone();
+                            let hunk_key = hunk_key.clone();
+                            move |_, window, cx| {
+                                if let Some(editor) = editor_handle.upgrade() {
+                                    editor.update(cx, |editor, cx| {
+                                        editor.dismiss_empty_diff_review_prompt(
+                                            &hunk_key, window, cx,
+                                        );
+                                    });
+                                }
+                            }
+                        })
                         .child(
                             div()
                                 .size(avatar_size)
@@ -5250,7 +5726,7 @@ impl Editor {
         reply_editor: Option<Entity<Editor>>,
         body_editor: Option<Entity<Editor>>,
         reply_body_editors: HashMap<usize, Entity<Editor>>,
-        _user_avatar_uri: Option<SharedUri>,
+        user_avatar_uri: Option<SharedUri>,
         editor_handle: WeakEntity<Editor>,
         avatar_size: Pixels,
         action_icon_size: IconSize,
@@ -5259,6 +5735,8 @@ impl Editor {
         let comment_id = comment.id;
         let author = comment.author.clone();
         let created_at = comment.created_at.clone();
+        let is_outdated = comment.outdated;
+        let outdated_reason = comment.outdated_reason.clone();
         let is_editing = inline_editor.is_some();
         let cancel_editor_handle = editor_handle.clone();
         let confirm_editor_handle = editor_handle.clone();
@@ -5291,13 +5769,24 @@ impl Editor {
                     .border_color(review_comment_border)
                     .bg(review_comment_background)
                     .child(if is_editing {
-                        Self::render_author_badge(author, avatar_size, colors).into_any_element()
+                        Self::render_author_badge(
+                            author,
+                            user_avatar_uri.clone(),
+                            avatar_size,
+                            colors,
+                        )
+                        .into_any_element()
                     } else {
                         div()
                             .absolute()
                             .top_1()
                             .left_2()
-                            .child(Self::render_author_badge(author, avatar_size, colors))
+                            .child(Self::render_author_badge(
+                                author,
+                                user_avatar_uri.clone(),
+                                avatar_size,
+                                colors,
+                            ))
                             .into_any_element()
                     })
                     .child(if let Some(editor) = inline_editor {
@@ -5377,6 +5866,28 @@ impl Editor {
                             .right_2()
                             .flex_shrink_0()
                             .gap_1()
+                            .when(is_outdated, |el| {
+                                let reason = match outdated_reason.as_deref() {
+                                    Some("file_not_in_diff") => "file no longer has a visible diff",
+                                    Some("line_not_in_diff") => "line no longer has a visible diff",
+                                    _ => "change no longer has a visible diff",
+                                };
+                                let mut badge = h_flex()
+                                    .px_1p5()
+                                    .h_5()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(colors.border_variant)
+                                    .bg(colors.element_background)
+                                    .child(
+                                        Label::new("Outdated")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Warning),
+                                    );
+                                gpui::InteractiveElement::interactivity(&mut badge)
+                                    .tooltip(Tooltip::text(reason));
+                                el.child(badge)
+                            })
                             .when_some(created_at, |el, created_at| {
                                 let mut timestamp = div().child(
                                     Label::new(review_comment_timestamp_label(&created_at))
@@ -5464,8 +5975,10 @@ impl Editor {
                                 .on_click(move |_, window, cx| {
                                     if let Some(editor) = delete_editor_handle.upgrade() {
                                         editor.update(cx, |editor, cx| {
-                                            editor.confirm_delete_review_comment(
-                                                comment_id, window, cx,
+                                            editor.delete_review_comment(
+                                                &DeleteReviewComment { id: comment_id },
+                                                window,
+                                                cx,
                                             );
                                         });
                                     }
@@ -5499,14 +6012,24 @@ impl Editor {
                     .border_color(review_comment_border)
                     .bg(review_comment_background)
                     .child(if is_editing_reply {
-                        Self::render_author_badge(reply.author, avatar_size, colors)
-                            .into_any_element()
+                        Self::render_author_badge(
+                            reply.author,
+                            user_avatar_uri.clone(),
+                            avatar_size,
+                            colors,
+                        )
+                        .into_any_element()
                     } else {
                         div()
                             .absolute()
                             .top_1()
                             .left_2()
-                            .child(Self::render_author_badge(reply.author, avatar_size, colors))
+                            .child(Self::render_author_badge(
+                                reply.author,
+                                user_avatar_uri.clone(),
+                                avatar_size,
+                                colors,
+                            ))
                             .into_any_element()
                     })
                     .child(if let Some(editor) = inline_reply_editor {
@@ -5685,6 +6208,7 @@ impl Editor {
                         .bg(colors.surface_background)
                         .child(Self::render_author_badge(
                             DEFAULT_REVIEW_COMMENT_AUTHOR.to_string(),
+                            user_avatar_uri.clone(),
                             avatar_size,
                             colors,
                         ))
@@ -5929,6 +6453,7 @@ impl Editor {
 
     fn render_author_badge(
         author: String,
+        user_avatar_uri: Option<SharedUri>,
         avatar_size: Pixels,
         colors: &theme::ThemeColors,
     ) -> impl IntoElement {
@@ -5951,7 +6476,12 @@ impl Editor {
             .child(if is_amp {
                 Label::new("🤖").size(LabelSize::XSmall).into_any_element()
             } else if is_vxio {
-                Label::new("🤠").size(LabelSize::XSmall).into_any_element()
+                Avatar::new(
+                    user_avatar_uri
+                        .unwrap_or_else(|| SharedUri::from("https://github.com/vxio.png?size=128")),
+                )
+                .size(avatar_size)
+                .into_any_element()
             } else {
                 Icon::new(IconName::Person)
                     .size(IconSize::XSmall)

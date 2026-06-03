@@ -530,6 +530,13 @@ impl EditorElement {
         register_action(editor, window, Editor::collapse_all_diff_hunks);
         register_action(editor, window, Editor::toggle_all_diff_hunks);
         register_action(editor, window, Editor::add_review_comment_action);
+        register_action(editor, window, Editor::go_to_next_review_comment_thread);
+        register_action(editor, window, Editor::go_to_previous_review_comment_thread);
+        register_action(
+            editor,
+            window,
+            Editor::restore_latest_deleted_review_comment,
+        );
         register_action(editor, window, Editor::toggle_review_comments_expanded);
         register_action(editor, window, Editor::submit_diff_review_comment_action);
         register_action(editor, window, Editor::send_review_to_agent);

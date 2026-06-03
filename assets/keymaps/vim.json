@@ -267,6 +267,12 @@
     },
   },
   {
+    "context": "Editor && review_comment_editor && vim_mode == normal",
+    "bindings": {
+      "enter": "menu::Confirm",
+    },
+  },
+  {
     "context": "VimControl && VimCount",
     "bindings": {
       "0": ["vim::Number", 0],

@@ -122,30 +122,6 @@ pub struct ProjectDiff {
     _subscription: Subscription,
 }
 
-#[derive(serde::Deserialize)]
-struct ReviewCommentsForDisplay {
-    comments: Vec<ReviewCommentForDisplay>,
-}
-
-#[derive(serde::Deserialize)]
-struct ReviewCommentForDisplay {
-    author: String,
-    file: String,
-    line_start: u32,
-    body: String,
-    #[serde(default)]
-    outdated: bool,
-    #[serde(default)]
-    outdated_reason: Option<String>,
-}
-
-#[derive(Clone)]
-struct OutdatedReviewCommentSummary {
-    location: String,
-    body: String,
-    reason: String,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefreshReason {
     DiffChanged,
@@ -940,43 +916,6 @@ impl ProjectDiff {
             self.loaded_review_comments_key = Some(review_key);
             self.loaded_review_comments_json = comments_json;
         }
-    }
-
-    fn outdated_review_comment_summaries(&self, cx: &App) -> Vec<OutdatedReviewCommentSummary> {
-        let Ok(comments_json) = self
-            .editor
-            .read(cx)
-            .rhs_editor()
-            .read(cx)
-            .review_comments_json(cx)
-        else {
-            return Vec::new();
-        };
-        let Ok(snapshot) = serde_json::from_str::<ReviewCommentsForDisplay>(&comments_json) else {
-            return Vec::new();
-        };
-
-        snapshot
-            .comments
-            .into_iter()
-            .filter(|comment| comment.outdated)
-            .map(|comment| {
-                let reason = match comment.outdated_reason.as_deref() {
-                    Some("file_not_in_diff") => "file no longer has a visible diff",
-                    Some("line_not_in_diff") => "line no longer has a visible diff",
-                    _ => "change no longer has a visible diff",
-                }
-                .to_string();
-                OutdatedReviewCommentSummary {
-                    location: format!(
-                        "{}:{} · {}",
-                        comment.file, comment.line_start, comment.author
-                    ),
-                    body: comment.body,
-                    reason,
-                }
-            })
-            .collect()
     }
 
     #[cfg(test)]
@@ -1964,7 +1903,12 @@ fn review_comments_json_restorable_comment_count(comments_json: &str) -> usize {
         .map(|comments| {
             comments
                 .iter()
-                .filter(|comment| comment.get("side").and_then(|side| side.as_str()) == Some("new"))
+                .filter(|comment| {
+                    comment.get("side").and_then(|side| side.as_str()) == Some("new")
+                        && comment
+                            .get("deleted_on")
+                            .is_none_or(|deleted_on| deleted_on.is_null())
+                })
                 .count()
         })
         .unwrap_or(0)
@@ -2191,8 +2135,6 @@ impl Render for ProjectDiff {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_empty = self.multibuffer.read(cx).is_empty();
         let is_loading = self.branch_diff.read(cx).is_tree_base_loading() || !self._task.is_ready();
-        let outdated_comments = self.outdated_review_comment_summaries(cx);
-        let outdated_comments_for_empty = outdated_comments.clone();
 
         let is_branch_diff_view = matches!(self.diff_base(cx), DiffBase::Merge { .. });
 
@@ -2236,45 +2178,6 @@ impl Render for ProjectDiff {
                                 .justify_around()
                                 .child(Label::new("No uncommitted changes")),
                         )
-                        .when(!outdated_comments_for_empty.is_empty(), |el| {
-                            let count = outdated_comments_for_empty.len();
-                            el.child(
-                                v_flex()
-                                    .gap_1()
-                                    .mt_2()
-                                    .p_2()
-                                    .border_1()
-                                    .border_color(cx.theme().colors().border)
-                                    .rounded_md()
-                                    .child(
-                                        h_flex()
-                                            .gap_1()
-                                            .child(
-                                                Icon::new(IconName::Warning).size(IconSize::XSmall),
-                                            )
-                                            .child(Label::new(format!(
-                                                "Outdated review comments ({count})"
-                                            ))),
-                                    )
-                                    .children(outdated_comments_for_empty.into_iter().map(
-                                        |comment| {
-                                            v_flex()
-                                                .gap_0p5()
-                                                .child(
-                                                    Label::new(format!(
-                                                        "{} — {}",
-                                                        comment.location, comment.reason
-                                                    ))
-                                                    .size(LabelSize::Small)
-                                                    .color(Color::Muted),
-                                                )
-                                                .child(
-                                                    Label::new(comment.body).size(LabelSize::Small),
-                                                )
-                                        },
-                                    )),
-                            )
-                        })
                         .map(|el| match remote_button {
                             Some(button) => el.child(h_flex().justify_around().child(button)),
                             None => el.child(
@@ -2304,44 +2207,7 @@ impl Render for ProjectDiff {
                 )
             })
             .when(!is_empty, |el| {
-                el.child(
-                    v_flex()
-                        .size_full()
-                        .when(!outdated_comments.is_empty(), |el| {
-                            let count = outdated_comments.len();
-                            el.child(
-                                v_flex()
-                                    .gap_1()
-                                    .p_2()
-                                    .border_b_1()
-                                    .border_color(cx.theme().colors().border)
-                                    .child(
-                                        h_flex()
-                                            .gap_1()
-                                            .child(
-                                                Icon::new(IconName::Warning).size(IconSize::XSmall),
-                                            )
-                                            .child(Label::new(format!(
-                                                "Outdated review comments ({count})"
-                                            ))),
-                                    )
-                                    .children(outdated_comments.into_iter().map(|comment| {
-                                        h_flex()
-                                            .gap_1()
-                                            .child(
-                                                Label::new(comment.location).size(LabelSize::Small),
-                                            )
-                                            .child(
-                                                Label::new(comment.reason)
-                                                    .size(LabelSize::Small)
-                                                    .color(Color::Muted),
-                                            )
-                                            .child(Label::new(comment.body).size(LabelSize::Small))
-                                    })),
-                            )
-                        })
-                        .child(self.editor.clone()),
-                )
+                el.child(v_flex().size_full().child(self.editor.clone()))
             })
     }
 }
@@ -4255,10 +4121,9 @@ mod tests {
             "file_not_in_diff"
         );
 
-        let summaries =
-            reopened_diff.read_with(cx, |diff, cx| diff.outdated_review_comment_summaries(cx));
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].body, "removed diff comment");
+        reopened_diff.read_with(cx, |diff, _cx| {
+            assert_eq!(diff.review_comment_count, 1);
+        });
     }
 
     #[gpui::test]

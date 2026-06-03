@@ -997,6 +997,12 @@ actions!(
         /// Opens a review comment prompt at the cursor line.
         #[action(deprecated_aliases = ["editor::AddReviewCommentAtMouse"])]
         AddComment,
+        /// Goes to the next review comment thread.
+        NextCommentThread,
+        /// Goes to the previous review comment thread.
+        PreviousCommentThread,
+        /// Restores the most recently deleted review comment thread.
+        RestoreLatestDeletedComment,
     ]
 );
 

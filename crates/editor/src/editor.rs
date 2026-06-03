@@ -1060,6 +1060,7 @@ pub struct Editor {
     expects_character_input: bool,
     use_modal_editing: bool,
     read_only: bool,
+    read_only_player_color: Option<PlayerColor>,
     leader_id: Option<CollaboratorId>,
     remote_id: Option<ViewId>,
     pub hover_state: HoverState,
@@ -1851,6 +1852,7 @@ impl Editor {
             .clone_state(&self.scroll_manager, &my_snapshot, &clone_snapshot, cx);
         clone.searchable = self.searchable;
         clone.read_only = self.read_only;
+        clone.read_only_player_color = self.read_only_player_color;
         clone.buffers_with_disabled_indent_guides =
             self.buffers_with_disabled_indent_guides.clone();
         clone.enable_mouse_wheel_zoom = self.enable_mouse_wheel_zoom;
@@ -2395,6 +2397,7 @@ impl Editor {
             expects_character_input: !is_minimap,
             use_modal_editing: full_mode,
             read_only: is_minimap,
+            read_only_player_color: None,
             use_autoclose: true,
             use_auto_surround: true,
             use_selection_highlight: true,
@@ -3530,6 +3533,12 @@ impl Editor {
             dismissed = true;
         }
         if !self.diff_review_overlays.is_empty() {
+            if self.dismiss_focused_diff_review_prompt(window, cx) {
+                return true;
+            }
+            if self.has_visible_review_comments(cx) {
+                return dismissed;
+            }
             self.dismiss_all_diff_review_overlays(cx);
             dismissed = true;
         }
@@ -4824,9 +4833,14 @@ impl Editor {
         self.context_menu_options = Some(options);
     }
 
+    pub fn set_read_only_player_color(&mut self, player_color: Option<PlayerColor>) {
+        self.read_only_player_color = player_color;
+    }
+
     fn current_user_player_color(&self, cx: &mut App) -> PlayerColor {
         if self.read_only(cx) {
-            cx.theme().players().read_only()
+            self.read_only_player_color
+                .unwrap_or_else(|| cx.theme().players().read_only())
         } else {
             self.style.as_ref().unwrap().local_player
         }
@@ -9858,6 +9872,7 @@ impl Editor {
                     }
                 }
 
+                self.refresh_review_comment_outdated_markers(cx);
                 cx.emit(EditorEvent::BufferEdited);
                 cx.emit(SearchEvent::MatchesInvalidated);
 

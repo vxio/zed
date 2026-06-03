@@ -41437,18 +41437,62 @@ fn test_review_comment_remove(cx: &mut TestAppContext) {
     _ = editor.update(cx, |editor: &mut Editor, _window, cx| {
         let key = test_hunk_key("");
 
-        let id = add_test_comment(editor, key, "To be removed", cx);
+        let id = add_test_comment(editor, key.clone(), "To be removed", cx);
 
         assert_eq!(editor.total_review_comment_count(), 1);
 
         let removed = editor.remove_review_comment(id, cx);
         assert!(removed);
         assert_eq!(editor.total_review_comment_count(), 0);
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        assert_eq!(editor.comments_for_hunk(&key, &snapshot).len(), 0);
+        let comments: serde_json::Value =
+            serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
+        assert!(comments["comments"][0]["deleted_on"].is_string());
 
-        // Try to remove again
         let removed_again = editor.remove_review_comment(id, cx);
         assert!(!removed_again);
     });
+}
+
+#[gpui::test]
+fn test_restore_latest_deleted_review_comment(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("line 1\nline 2\n", cx));
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+
+    editor
+        .update(cx, |editor, _window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let anchor = snapshot.anchor_after(Point::new(1, 0));
+            let id = editor.add_review_comment(
+                test_hunk_key_with_anchor("", anchor),
+                "restore me".to_string(),
+                anchor..anchor,
+                cx,
+            );
+            assert!(editor.remove_review_comment(id, cx));
+            assert_eq!(editor.total_review_comment_count(), 0);
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.restore_latest_deleted_review_comment(
+                &crate::actions::RestoreLatestDeletedComment,
+                window,
+                cx,
+            );
+            assert_eq!(editor.total_review_comment_count(), 1);
+            let comments: serde_json::Value =
+                serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
+            assert!(comments["comments"][0].get("deleted_on").is_none());
+        })
+        .unwrap();
 }
 
 #[gpui::test]
@@ -41643,6 +41687,60 @@ fn test_diff_review_empty_comment_not_submitted(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_diff_review_empty_prompt_dismisses_when_empty(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            assert_eq!(editor.diff_review_overlays.len(), 1);
+
+            let hunk_key = editor.diff_review_overlays[0].hunk_key.clone();
+            assert!(editor.dismiss_empty_diff_review_prompt(&hunk_key, window, cx));
+
+            assert!(editor.diff_review_overlays.is_empty());
+            assert_eq!(editor.total_review_comment_count(), 0);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_diff_review_draft_prompt_stays_unsubmitted_when_not_empty(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("line 1\nline 2\n", cx));
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            let first_prompt = editor.diff_review_prompt_editor().cloned().unwrap();
+            first_prompt.update(cx, |prompt_editor, cx| {
+                prompt_editor.insert("draft", window, cx);
+            });
+            let first_hunk_key = editor.diff_review_overlays[0].hunk_key.clone();
+
+            assert!(!editor.dismiss_empty_diff_review_prompt(&first_hunk_key, window, cx));
+            assert_eq!(editor.diff_review_overlays.len(), 1);
+            assert!(editor.diff_review_overlays[0].prompt_visible);
+            assert_eq!(editor.total_review_comment_count(), 0);
+            assert_eq!(first_prompt.read(cx).text(cx), "draft");
+
+            editor.show_diff_review_overlay(DisplayRow(1)..DisplayRow(1), window, cx);
+
+            assert_eq!(editor.diff_review_overlays.len(), 2);
+            assert_eq!(first_prompt.read(cx).text(cx), "draft");
+            assert_eq!(editor.total_review_comment_count(), 0);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn test_diff_review_prompt_close_keeps_comments(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
@@ -41670,6 +41768,100 @@ fn test_diff_review_prompt_close_keeps_comments(cx: &mut TestAppContext) {
             assert_eq!(editor.total_review_comment_count(), 1);
             assert_eq!(editor.diff_review_overlays.len(), 1);
             assert!(!editor.diff_review_overlays[0].prompt_visible);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_diff_review_prompt_escape_keeps_comments_visible(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            let prompt_editor = editor.diff_review_prompt_editor().cloned().unwrap();
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.insert("keep me", window, cx);
+            });
+            editor.submit_diff_review_comment(window, cx);
+
+            assert_eq!(editor.total_review_comment_count(), 1);
+            assert_eq!(editor.diff_review_overlays.len(), 1);
+
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            assert!(editor.diff_review_overlays[0].prompt_visible);
+
+            editor.dismiss_menus_and_popups(true, window, cx);
+
+            assert_eq!(editor.total_review_comment_count(), 1);
+            assert_eq!(editor.diff_review_overlays.len(), 1);
+            assert!(!editor.diff_review_overlays[0].prompt_visible);
+
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let overlay = editor.diff_review_overlays.first().expect("review overlay");
+            let comments = editor.comments_for_hunk(&overlay.hunk_key, &snapshot);
+            assert_eq!(comments.len(), 1);
+            assert_eq!(comments[0].comment, "keep me");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_diff_review_prompt_enter_confirms_in_vim_normal_mode(cx: &mut TestAppContext) {
+    struct VimNormalModeAddon;
+
+    impl Addon for VimNormalModeAddon {
+        fn extend_key_context(&self, key_context: &mut gpui::KeyContext, _: &gpui::App) {
+            key_context.set("vim_mode", "normal");
+        }
+
+        fn to_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    init_test(cx, |_| {});
+    cx.update(|cx| {
+        let default_key_bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+            "keymaps/default-macos.json",
+            cx,
+        )
+        .unwrap();
+        cx.bind_keys(default_key_bindings);
+
+        let vim_key_bindings =
+            settings::KeymapFile::load_asset_allow_partial_failure("keymaps/vim.json", cx).unwrap();
+        cx.bind_keys(vim_key_bindings);
+    });
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+    let cx = &mut VisualTestContext::from_window(*editor, cx);
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            let prompt_editor = editor.diff_review_prompt_editor().cloned().unwrap();
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.register_addon(VimNormalModeAddon);
+                prompt_editor.insert("submit from normal", window, cx);
+                window.focus(&prompt_editor.focus_handle(cx), cx);
+            });
+        })
+        .unwrap();
+
+    refresh_editor_actions(cx);
+    cx.simulate_keystrokes("enter");
+
+    editor
+        .update(cx, |editor, _window, cx| {
+            assert_eq!(editor.total_review_comment_count(), 1);
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let overlay = editor.diff_review_overlays.first().expect("review overlay");
+            let comments = editor.comments_for_hunk(&overlay.hunk_key, &snapshot);
+            assert_eq!(comments.len(), 1);
+            assert_eq!(comments[0].comment, "submit from normal");
         })
         .unwrap();
 }
@@ -41770,7 +41962,8 @@ fn test_diff_review_inline_edit_cancel_keeps_comment(cx: &mut TestAppContext) {
             assert_eq!(comment.comment, "Original comment");
             assert!(!comment.is_editing);
             assert!(overlay.inline_edit_editors.is_empty());
-            assert!(overlay.body_editors.contains_key(&comment.id));
+            let body_editor = overlay.body_editors.get(&comment.id).expect("body editor");
+            assert_eq!(body_editor.read(cx).cursor_shape(), CursorShape::Block);
         })
         .unwrap();
 }
@@ -41863,6 +42056,113 @@ fn test_orphaned_comments_survive_buffer_edit(cx: &mut TestAppContext) {
     editor
         .update(cx, |editor, _window, _cx| {
             assert_eq!(editor.total_review_comment_count(), 1);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_review_comment_marked_outdated_after_line_removed(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("line 1\nline 2\nline 3\n", cx));
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+
+    editor
+        .update(cx, |editor, _window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let anchor = snapshot.anchor_after(Point::new(1, 0));
+            let key = DiffHunkKey {
+                file_path: Arc::from(util::rel_path::RelPath::empty()),
+                hunk_start_anchor: anchor,
+            };
+            editor.add_review_comment(key, "Comment on line 2".to_string(), anchor..anchor, cx);
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.select_all(&SelectAll, window, cx);
+            editor.insert("line 1\nline 3\n", window, cx);
+            assert!(editor.refresh_review_comment_outdated_markers(cx));
+
+            let comments: serde_json::Value =
+                serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
+            assert_eq!(comments["comments"][0]["body"], "Comment on line 2");
+            assert_eq!(comments["comments"][0]["outdated"], true);
+            assert_eq!(
+                comments["comments"][0]["outdated_reason"],
+                "line_not_in_diff"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_go_to_next_and_previous_review_comment_thread(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("line 1\nline 2\nline 3\nline 4\n", cx));
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+
+    editor
+        .update(cx, |editor, _window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let first_anchor = snapshot.anchor_after(Point::new(1, 0));
+            let second_anchor = snapshot.anchor_after(Point::new(3, 0));
+            editor.add_review_comment(
+                test_hunk_key_with_anchor("", first_anchor),
+                "first".to_string(),
+                first_anchor..first_anchor,
+                cx,
+            );
+            editor.add_review_comment(
+                test_hunk_key_with_anchor("", second_anchor),
+                "second".to_string(),
+                second_anchor..second_anchor,
+                cx,
+            );
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.go_to_next_review_comment_thread(&crate::actions::NextCommentThread, window, cx);
+            let position = editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx))
+                .head();
+            assert_eq!(position, Point::new(1, 0));
+
+            editor.go_to_next_review_comment_thread(&crate::actions::NextCommentThread, window, cx);
+            let position = editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx))
+                .head();
+            assert_eq!(position, Point::new(3, 0));
+
+            editor.go_to_next_review_comment_thread(&crate::actions::NextCommentThread, window, cx);
+            let position = editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx))
+                .head();
+            assert_eq!(position, Point::new(1, 0));
+
+            editor.go_to_previous_review_comment_thread(
+                &crate::actions::PreviousCommentThread,
+                window,
+                cx,
+            );
+            let position = editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx))
+                .head();
+            assert_eq!(position, Point::new(3, 0));
         })
         .unwrap();
 }
