@@ -3878,7 +3878,7 @@ impl Editor {
                     let inline_editor = cx.new(|cx| {
                         let mut editor = Self::review_comment_input_editor(window, cx);
                         editor.set_text(&*comment_text, window, cx);
-                        editor.select_all(&crate::actions::SelectAll, window, cx);
+                        editor.move_to_end(&crate::actions::MoveToEnd, window, cx);
                         editor.diff_review_editor_cancel = Some(DiffReviewEditorCancel::edit(
                             parent_editor.clone(),
                             comment_id,
