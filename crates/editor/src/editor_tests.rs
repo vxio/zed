@@ -41741,6 +41741,65 @@ fn test_diff_review_draft_prompt_stays_unsubmitted_when_not_empty(cx: &mut TestA
 }
 
 #[gpui::test]
+fn test_diff_review_cancel_with_text_confirms_before_discard(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("line 1\nline 2\n", cx));
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+
+    let hunk_key = editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            let prompt_editor = editor.diff_review_prompt_editor().cloned().unwrap();
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.insert("unsaved draft", window, cx);
+            });
+            let hunk_key = editor.diff_review_overlays[0].hunk_key.clone();
+            editor.cancel_diff_review_prompt(&hunk_key, window, cx);
+            hunk_key
+        })
+        .unwrap();
+
+    assert!(cx.has_pending_prompt());
+    editor
+        .update(cx, |editor, _window, cx| {
+            assert_eq!(editor.diff_review_overlays.len(), 1);
+            assert!(editor.diff_review_overlays[0].confirming_discard);
+            let prompt_editor = editor.diff_review_prompt_editor().cloned().unwrap();
+            assert_eq!(prompt_editor.read(cx).text(cx), "unsaved draft");
+        })
+        .unwrap();
+
+    cx.simulate_prompt_answer("Keep editing");
+    cx.run_until_parked();
+    editor
+        .update(cx, |editor, _window, cx| {
+            assert_eq!(editor.diff_review_overlays.len(), 1);
+            assert!(!editor.diff_review_overlays[0].confirming_discard);
+            let prompt_editor = editor.diff_review_prompt_editor().cloned().unwrap();
+            assert_eq!(prompt_editor.read(cx).text(cx), "unsaved draft");
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.cancel_diff_review_prompt(&hunk_key, window, cx);
+        })
+        .unwrap();
+    assert!(cx.has_pending_prompt());
+    cx.simulate_prompt_answer("Discard");
+    cx.run_until_parked();
+    editor
+        .update(cx, |editor, _window, _cx| {
+            assert!(editor.diff_review_overlays.is_empty());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn test_diff_review_prompt_close_keeps_comments(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
