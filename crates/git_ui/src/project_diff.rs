@@ -657,6 +657,14 @@ impl ProjectDiff {
     }
 
     fn review_comments_key(&self, cx: &App) -> Option<String> {
+        let branch_key = self.review_comments_branch_key(cx)?;
+        Some(format!(
+            "{branch_key}\n{}",
+            self.review_comments_view_suffix(cx)
+        ))
+    }
+
+    fn review_comments_branch_key(&self, cx: &App) -> Option<String> {
         let repo = self.branch_diff.read(cx).repo()?.read(cx);
         let review_ref = repo
             .branch
@@ -676,14 +684,30 @@ impl ProjectDiff {
         ))
     }
 
-    fn legacy_review_comments_key(&self, cx: &App) -> Option<String> {
-        let repo = self.branch_diff.read(cx).repo()?.read(cx);
-        let diff_base = serde_json::to_string(self.diff_base(cx)).log_err()?;
-        Some(format!(
-            "{}\n{}",
-            repo.work_directory_abs_path.display(),
-            diff_base
-        ))
+    fn review_comments_view_suffix(&self, cx: &App) -> String {
+        match self.diff_base(cx) {
+            DiffBase::Head => "uncommitted".to_string(),
+            DiffBase::Merge { base_ref } => format!("since:{base_ref}"),
+        }
+    }
+
+    // The uncommitted and branch-diff views used to share a single branch-keyed
+    // bucket. Only the branch-diff view inherits those older comments so they
+    // don't get duplicated into both views after the split.
+    fn legacy_review_comments_keys(&self, cx: &App) -> Vec<String> {
+        let mut keys = Vec::new();
+        if let Some(repo) = self.branch_diff.read(cx).repo() {
+            let repo_path = repo.read(cx).work_directory_abs_path.display().to_string();
+            if let Some(diff_base) = serde_json::to_string(self.diff_base(cx)).log_err() {
+                keys.push(format!("{repo_path}\n{diff_base}"));
+            }
+        }
+        if matches!(self.diff_base(cx), DiffBase::Merge { .. }) {
+            if let Some(branch_key) = self.review_comments_branch_key(cx) {
+                keys.push(branch_key);
+            }
+        }
+        keys
     }
 
     fn persist_review_comments(&self, comments_json: String, cx: &mut Context<Self>) {
@@ -852,17 +876,19 @@ impl ProjectDiff {
             }
         };
         if comments_json.is_none() {
-            if let Some(legacy_key) = self.legacy_review_comments_key(cx) {
-                if legacy_key != review_key {
-                    comments_json = match db.get_review_comments(workspace_id, &legacy_key) {
-                        Ok(comments_json) => comments_json,
-                        Err(error) => {
-                            log::error!("failed to load legacy review comments: {error:#}");
-                            None
-                        }
-                    };
-                    if comments_json.is_some() {
+            for legacy_key in self.legacy_review_comments_keys(cx) {
+                if legacy_key == review_key {
+                    continue;
+                }
+                match db.get_review_comments(workspace_id, &legacy_key) {
+                    Ok(Some(json)) => {
+                        comments_json = Some(json);
                         loaded_key = legacy_key;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        log::error!("failed to load legacy review comments: {error:#}");
                     }
                 }
             }
@@ -2451,9 +2477,16 @@ mod persistence {
         }
 
         pub fn modified_on(&self) -> Option<std::time::SystemTime> {
-            std::fs::metadata(db::db_path(db::database_dir(), *db::RELEASE_CHANNEL))
-                .and_then(|metadata| metadata.modified())
-                .ok()
+            let db_path = db::db_path(db::database_dir(), *db::RELEASE_CHANNEL);
+            let wal_path = {
+                let mut path = db_path.clone().into_os_string();
+                path.push("-wal");
+                std::path::PathBuf::from(path)
+            };
+            [db_path, wal_path]
+                .into_iter()
+                .filter_map(|path| std::fs::metadata(path).and_then(|m| m.modified()).ok())
+                .max()
         }
 
         pub fn latest_archived_review_comments(
@@ -4127,7 +4160,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_review_comments_restore_after_diff_base_changes(cx: &mut TestAppContext) {
+    async fn test_review_comments_are_scoped_per_diff_view(cx: &mut TestAppContext) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -4193,13 +4226,30 @@ mod tests {
                         cx,
                     );
                 });
+                assert_ne!(diff.review_comments_key(cx).as_ref(), Some(&review_key));
+                diff.loaded_review_comments_key = None;
+                diff.restore_review_comments_if_needed(window, cx);
+            })
+        });
+        cx.run_until_parked();
+
+        let editor = diff.read_with(cx, |diff, cx| diff.editor.read(cx).rhs_editor().clone());
+        let in_branch_view =
+            editor.read_with(cx, |editor, cx| editor.review_comments_json(cx).unwrap());
+        assert!(!in_branch_view.contains("base agnostic"));
+
+        cx.update(|window, cx| {
+            diff.update(cx, |diff, cx| {
+                diff.branch_diff.update(cx, |branch_diff, cx| {
+                    branch_diff.set_diff_base(DiffBase::Head, cx);
+                });
                 assert_eq!(diff.review_comments_key(cx).as_ref(), Some(&review_key));
                 diff.loaded_review_comments_key = None;
                 diff.restore_review_comments_if_needed(window, cx);
             })
         });
+        cx.run_until_parked();
 
-        let editor = diff.read_with(cx, |diff, cx| diff.editor.read(cx).rhs_editor().clone());
         let restored = editor.read_with(cx, |editor, cx| editor.review_comments_json(cx).unwrap());
         assert!(restored.contains("base agnostic"));
     }
