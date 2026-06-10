@@ -187,3 +187,7 @@ Rules emerge from validated patterns, not one-off observations. The workflow is:
 1. Agent notes a pattern during a session.
 2. Team validates the pattern in code review.
 3. A dedicated commit adds the rule with context on *why* it exists.
+
+# Zed Fork Sync
+
+When asked to update or sync this fork with upstream Zed and the worktree has local changes, always commit the local changes first, then run the fork sync workflow. Do not stash or discard the changes unless Vince explicitly asks for that instead.
