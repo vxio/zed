@@ -1003,6 +1003,22 @@ actions!(
         PreviousCommentThread,
         /// Restores the most recently deleted review comment thread.
         RestoreLatestDeletedComment,
+        /// Replies to the review comment nearest the cursor.
+        ReplyToComment,
+        /// Edits the review comment nearest the cursor.
+        EditComment,
+        /// Deletes the review comment nearest the cursor.
+        DeleteComment,
+        /// Copies a reference to the review comment nearest the cursor.
+        CopyCommentReference,
+        /// Resolves the review comment thread nearest the cursor.
+        ResolveThread,
+        /// Unresolves the review comment thread nearest the cursor.
+        UnresolveThread,
+        /// Expands or collapses the resolved review comment thread nearest the cursor.
+        ToggleResolvedThread,
+        /// Expands all review comment threads, or collapses them all if every thread is already open.
+        ToggleAllComments,
     ]
 );
 
@@ -1048,6 +1064,30 @@ pub struct DeleteReviewComment {
 #[action(namespace = editor)]
 #[serde(deny_unknown_fields)]
 pub struct ReplyToReviewComment {
+    pub id: usize,
+}
+
+/// Resolves a stored review comment thread.
+#[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveReviewComment {
+    pub id: usize,
+}
+
+/// Unresolves a stored review comment thread.
+#[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct UnresolveReviewComment {
+    pub id: usize,
+}
+
+/// Expands or collapses a resolved review comment thread in place.
+#[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct ToggleResolvedReviewComment {
     pub id: usize,
 }
 

@@ -537,11 +537,30 @@ impl EditorElement {
             Editor::restore_latest_deleted_review_comment,
         );
         register_action(editor, window, Editor::toggle_review_comments_expanded);
+        register_action(editor, window, Editor::toggle_all_review_comments);
         register_action(editor, window, Editor::submit_diff_review_comment_action);
         register_action(editor, window, Editor::send_review_to_agent);
         register_action(editor, window, Editor::edit_review_comment);
         register_action(editor, window, Editor::reply_to_review_comment);
         register_action(editor, window, Editor::delete_review_comment);
+        register_action(editor, window, Editor::reply_to_current_review_comment);
+        register_action(editor, window, Editor::edit_current_review_comment);
+        register_action(editor, window, Editor::delete_current_review_comment);
+        register_action(
+            editor,
+            window,
+            Editor::copy_current_review_comment_reference,
+        );
+        register_action(editor, window, Editor::resolve_review_comment);
+        register_action(editor, window, Editor::unresolve_review_comment);
+        register_action(editor, window, Editor::toggle_show_resolved_review_comment);
+        register_action(editor, window, Editor::resolve_current_review_comment);
+        register_action(editor, window, Editor::unresolve_current_review_comment);
+        register_action(
+            editor,
+            window,
+            Editor::toggle_resolved_current_review_comment,
+        );
         register_action(editor, window, Editor::confirm_edit_review_comment_action);
         register_action(editor, window, Editor::cancel_edit_review_comment_action);
         register_action(editor, window, Editor::confirm_edit_review_reply_action);

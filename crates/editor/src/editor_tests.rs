@@ -42021,8 +42021,7 @@ fn test_diff_review_inline_edit_cancel_keeps_comment(cx: &mut TestAppContext) {
             assert_eq!(comment.comment, "Original comment");
             assert!(!comment.is_editing);
             assert!(overlay.inline_edit_editors.is_empty());
-            let body_editor = overlay.body_editors.get(&comment.id).expect("body editor");
-            assert_eq!(body_editor.read(cx).cursor_shape(), CursorShape::Block);
+            assert!(overlay.body_editors.is_empty());
         })
         .unwrap();
 }
@@ -42077,6 +42076,48 @@ fn test_diff_review_reply_flow_persists(cx: &mut TestAppContext) {
                 value["comments"][0]["replies"][0]["created_at"]
                     .as_str()
                     .is_some()
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_diff_review_resolve_round_trips(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            let prompt_editor = editor.diff_review_prompt_editor().cloned().unwrap();
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.insert("Comment to resolve", window, cx);
+            });
+            editor.submit_diff_review_comment(window, cx);
+
+            editor.resolve_review_comment(
+                &crate::actions::ResolveReviewComment { id: 0 },
+                window,
+                cx,
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
+            assert!(
+                value["comments"][0]["resolved_on"].as_str().is_some(),
+                "resolved_on should persist after resolving"
+            );
+
+            editor.unresolve_review_comment(
+                &crate::actions::UnresolveReviewComment { id: 0 },
+                window,
+                cx,
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
+            assert!(
+                value["comments"][0]["resolved_on"].is_null(),
+                "resolved_on should clear after unresolving"
             );
         })
         .unwrap();
@@ -42401,6 +42442,203 @@ fn test_overlay_comments_expanded_state(cx: &mut TestAppContext) {
             assert!(
                 editor.diff_review_overlays[0].comments_expanded,
                 "Should be expanded after setting to true"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_review_comment_bodies_do_not_materialize_editors(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    editor
+        .update(cx, |editor, window, cx| {
+            let key = test_hunk_key("");
+            add_test_comment(editor, key, "Test comment", cx);
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+
+            let hunk_key = editor.diff_review_overlays[0].hunk_key.clone();
+            assert!(editor.diff_review_overlays[0].body_editors.is_empty());
+
+            editor.toggle_review_comments_expanded_for_hunk(&hunk_key, window, cx);
+            assert!(
+                !editor.diff_review_overlays[0].comments_expanded,
+                "overlay should be collapsed after toggle"
+            );
+            assert!(editor.diff_review_overlays[0].body_editors.is_empty());
+
+            editor.toggle_review_comments_expanded_for_hunk(&hunk_key, window, cx);
+            assert!(editor.diff_review_overlays[0].body_editors.is_empty());
+
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            assert_eq!(
+                editor.comments_for_hunk(&hunk_key, &snapshot).len(),
+                1,
+                "comment data should survive collapse/expand"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_toggle_all_review_comments(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("line 1\nline 2\nline 3\nline 4\n", cx));
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+
+    editor
+        .update(cx, |editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let first_anchor = snapshot.anchor_after(Point::new(1, 0));
+            let second_anchor = snapshot.anchor_after(Point::new(3, 0));
+            editor.add_review_comment(
+                test_hunk_key_with_anchor("", first_anchor),
+                "first".to_string(),
+                first_anchor..first_anchor,
+                cx,
+            );
+            editor.add_review_comment(
+                test_hunk_key_with_anchor("", second_anchor),
+                "second".to_string(),
+                second_anchor..second_anchor,
+                cx,
+            );
+            editor.show_diff_review_overlay(DisplayRow(1)..DisplayRow(1), window, cx);
+            editor.show_diff_review_overlay(DisplayRow(3)..DisplayRow(3), window, cx);
+            assert_eq!(editor.diff_review_overlays.len(), 2);
+            assert!(
+                editor
+                    .diff_review_overlays
+                    .iter()
+                    .all(|o| o.comments_expanded),
+                "both threads start expanded"
+            );
+
+            editor.toggle_all_review_comments(&ToggleAllComments, window, cx);
+            assert!(
+                editor
+                    .diff_review_overlays
+                    .iter()
+                    .all(|o| !o.comments_expanded),
+                "toggling with every thread open should collapse all"
+            );
+
+            editor.toggle_all_review_comments(&ToggleAllComments, window, cx);
+            assert!(
+                editor
+                    .diff_review_overlays
+                    .iter()
+                    .all(|o| o.comments_expanded),
+                "toggling with every thread closed should expand all"
+            );
+
+            editor.diff_review_overlays[0].comments_expanded = false;
+            editor.toggle_all_review_comments(&ToggleAllComments, window, cx);
+            assert!(
+                editor
+                    .diff_review_overlays
+                    .iter()
+                    .all(|o| o.comments_expanded),
+                "a mix of open and closed threads should expand all"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_toggle_targets_only_clicked_thread(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("line 1\nline 2\nline 3\nline 4\n", cx));
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+
+    editor
+        .update(cx, |editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let first_anchor = snapshot.anchor_after(Point::new(1, 0));
+            let second_anchor = snapshot.anchor_after(Point::new(3, 0));
+            editor.add_review_comment(
+                test_hunk_key_with_anchor("", first_anchor),
+                "first".to_string(),
+                first_anchor..first_anchor,
+                cx,
+            );
+            editor.add_review_comment(
+                test_hunk_key_with_anchor("", second_anchor),
+                "second".to_string(),
+                second_anchor..second_anchor,
+                cx,
+            );
+            editor.show_diff_review_overlay(DisplayRow(1)..DisplayRow(1), window, cx);
+            editor.show_diff_review_overlay(DisplayRow(3)..DisplayRow(3), window, cx);
+            assert_eq!(editor.diff_review_overlays.len(), 2);
+            assert!(
+                editor
+                    .diff_review_overlays
+                    .iter()
+                    .all(|o| o.comments_expanded),
+                "both threads start expanded"
+            );
+
+            let key0 = editor.diff_review_overlays[0].hunk_key.clone();
+            editor.toggle_review_comments_expanded_for_hunk(&key0, window, cx);
+            assert!(
+                !editor.diff_review_overlays[0].comments_expanded,
+                "toggling one thread should collapse only it"
+            );
+            assert!(
+                editor.diff_review_overlays[1].comments_expanded,
+                "the other thread must stay in its prior state"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_restore_preserves_collapsed_state(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("line 1\nline 2\nline 3\n", cx));
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            let prompt_editor = editor.diff_review_prompt_editor().cloned().unwrap();
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.insert("Comment to collapse", window, cx);
+            });
+            editor.submit_diff_review_comment(window, cx);
+
+            let hunk_key = editor.diff_review_overlays[0].hunk_key.clone();
+            editor.toggle_review_comments_expanded_for_hunk(&hunk_key, window, cx);
+            assert!(
+                !editor.diff_review_overlays[0].comments_expanded,
+                "overlay should be collapsed after toggle"
+            );
+
+            // Simulate an agent writing to the DB: reload the same comments from JSON.
+            let json = editor.review_comments_json(cx).unwrap();
+            editor
+                .restore_review_comments_json(&json, window, cx)
+                .unwrap();
+
+            assert_eq!(editor.diff_review_overlays.len(), 1);
+            assert!(
+                !editor.diff_review_overlays[0].comments_expanded,
+                "reload must not re-expand a thread the user had collapsed"
             );
         })
         .unwrap();

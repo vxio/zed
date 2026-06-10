@@ -340,6 +340,7 @@ pub(super) struct StoredReviewComment {
     pub(super) author: String,
     pub(super) created_at: Option<String>,
     pub(super) deleted_on: Option<String>,
+    pub(super) resolved_on: Option<String>,
     pub(super) comment: String,
     pub(super) range: Range<Anchor>,
     pub(super) replies: Vec<StoredReviewReply>,
@@ -347,6 +348,8 @@ pub(super) struct StoredReviewComment {
     pub(super) outdated: bool,
     pub(super) outdated_reason: Option<String>,
     pub(super) review_round: Option<u32>,
+    /// Runtime-only: expands a resolved thread in place without unresolving it.
+    pub(super) show_resolved: bool,
     location: ReviewCommentLocation,
 }
 
@@ -433,12 +436,6 @@ struct ReviewCommentMention {
     show_at_prefix: bool,
 }
 
-struct ReviewCommentMentionSpan {
-    start: usize,
-    len: usize,
-    mention: ReviewCommentMention,
-}
-
 struct ReviewCommentEditorAddon;
 
 impl Addon for ReviewCommentEditorAddon {
@@ -475,6 +472,8 @@ pub(super) struct ReviewCommentSnapshot {
     created_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     deleted_on: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolved_on: Option<String>,
     file: String,
     side: String,
     hunk_line: u32,
@@ -1221,53 +1220,6 @@ fn parse_review_comment_body(comment: &str) -> Vec<Vec<ReviewCommentBodySegment>
         .collect()
 }
 
-fn review_comment_mention_spans(comment: &str) -> Vec<ReviewCommentMentionSpan> {
-    let mut spans = Vec::new();
-    let mut remaining = comment;
-    let mut offset = 0;
-
-    while let Some(open_index) = remaining.find('[') {
-        let link_start = &remaining[open_index..];
-        let Some(label_end) = find_review_comment_markdown_delimiter(link_start, '[', ']') else {
-            break;
-        };
-        if link_start.get(label_end + 1..label_end + 2) != Some("(") {
-            offset += open_index + 1;
-            remaining = &link_start[1..];
-            continue;
-        }
-
-        let url_start = label_end + 2;
-        let Some(url_end_relative) =
-            find_review_comment_markdown_delimiter(&link_start[label_end + 1..], '(', ')')
-        else {
-            break;
-        };
-        let url_end = label_end + 1 + url_end_relative;
-        let raw_label = &link_start[1..label_end];
-        let (label, show_at_prefix) = raw_label
-            .strip_prefix('@')
-            .map_or((raw_label, false), |label| (label, true));
-        let url = &link_start[url_start..url_end];
-        if let Some(mention) = build_review_comment_mention(label, url) {
-            spans.push(ReviewCommentMentionSpan {
-                start: offset + open_index,
-                len: url_end + 1,
-                mention: ReviewCommentMention {
-                    show_at_prefix,
-                    ..mention
-                },
-            });
-        }
-
-        let consumed = open_index + url_end + 1;
-        offset += consumed;
-        remaining = &remaining[consumed..];
-    }
-
-    spans
-}
-
 fn parse_review_comment_line(line: &str) -> Vec<ReviewCommentBodySegment> {
     let mut segments = Vec::new();
     let mut remaining = line;
@@ -1542,6 +1494,7 @@ impl StoredReviewComment {
             author,
             created_at: current_review_comment_timestamp(),
             deleted_on: None,
+            resolved_on: None,
             comment,
             range: anchor_range,
             replies,
@@ -1549,6 +1502,7 @@ impl StoredReviewComment {
             outdated: false,
             outdated_reason: None,
             review_round: None,
+            show_resolved: false,
             location,
         }
     }
@@ -1560,36 +1514,6 @@ impl Editor {
         Self::configure_review_comment_editor(&mut editor, cx);
         editor.register_addon(ReviewCommentEditorAddon);
         editor
-    }
-
-    fn review_comment_body_editor(
-        comment: String,
-        open_editor: WeakEntity<Editor>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<Editor> {
-        cx.new(|cx| {
-            let mut editor = Editor::auto_height_unbounded(1, window, cx);
-            editor.set_text(comment.clone(), window, cx);
-            editor.set_read_only(true);
-            editor.set_use_modal_editing(false);
-            let selection_color = cx.theme().colors().text_accent;
-            editor.set_read_only_player_color(Some(PlayerColor {
-                cursor: selection_color,
-                background: selection_color.opacity(0.45),
-                selection: selection_color.opacity(0.85),
-            }));
-            editor.set_cursor_shape(CursorShape::Block, cx);
-            editor.set_show_gutter(false, cx);
-            editor.set_show_line_numbers(false, cx);
-            editor.set_show_git_diff_gutter(false, cx);
-            editor.set_show_indent_guides(false, cx);
-            editor.set_show_vertical_scrollbar(false, cx);
-            editor.set_show_horizontal_scrollbar(false, cx);
-            editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
-            editor.insert_review_body_mention_creases(&comment, open_editor, window, cx);
-            editor
-        })
     }
 
     fn configure_review_comment_editor(editor: &mut Editor, cx: &mut Context<Self>) {
@@ -1651,11 +1575,18 @@ impl Editor {
         mut confirm: impl FnMut(&mut Window, &mut App) + 'static,
     ) -> Subscription {
         let focus_handle = editor.focus_handle(cx);
+        let editor = editor.downgrade();
         cx.intercept_keystrokes(move |event, window, cx| {
             if event.keystroke.key == "enter"
                 && !event.keystroke.modifiers.modified()
                 && focus_handle.contains_focused(window, cx)
             {
+                let completion_open = editor
+                    .read_with(cx, |editor, _| editor.context_menu_visible())
+                    .unwrap_or(false);
+                if completion_open {
+                    return;
+                }
                 confirm(window, cx);
                 cx.stop_propagation();
             }
@@ -1725,38 +1656,6 @@ impl Editor {
         };
         self.insert_creases(vec![crease.clone()], cx);
         self.fold_creases(vec![crease], false, window, cx);
-    }
-
-    fn insert_review_body_mention_creases(
-        &mut self,
-        comment: &str,
-        open_editor: WeakEntity<Editor>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let snapshot = self.buffer().read(cx).snapshot(cx);
-        let Some(buffer_snapshot) = snapshot.as_singleton() else {
-            return;
-        };
-        let spans = review_comment_mention_spans(comment);
-        for span in spans {
-            let label = if span.mention.show_at_prefix {
-                format!("@{}", span.mention.label)
-            } else {
-                span.mention.label
-            };
-            self.insert_review_mention_crease_with_opener(
-                buffer_snapshot.anchor_before(span.start),
-                span.len,
-                label.into(),
-                span.mention.icon.path().into(),
-                Some(span.mention.url.into()),
-                span.mention.tooltip,
-                open_editor.clone(),
-                window,
-                cx,
-            );
-        }
     }
 
     fn focus_review_comment_editor(
@@ -2148,13 +2047,14 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.show_diff_review_overlay_with_prompt(display_range, true, window, cx);
+        self.show_diff_review_overlay_with_prompt(display_range, true, true, window, cx);
     }
 
     fn show_diff_review_overlay_with_prompt(
         &mut self,
         display_range: Range<DisplayRow>,
         prompt_visible: bool,
+        comments_expanded: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2309,8 +2209,13 @@ impl Editor {
             )
         });
 
-        let initial_height =
-            self.calculate_overlay_height(&hunk_key, true, prompt_visible, &buffer_snapshot, cx);
+        let initial_height = self.calculate_overlay_height(
+            &hunk_key,
+            comments_expanded,
+            prompt_visible,
+            &buffer_snapshot,
+            cx,
+        );
 
         // Create the overlay block
         let prompt_editor_for_render = prompt_editor.clone();
@@ -2342,7 +2247,7 @@ impl Editor {
             block_id,
             prompt_editor: prompt_editor.clone(),
             hunk_key: hunk_key.clone(),
-            comments_expanded: true,
+            comments_expanded,
             prompt_visible,
             confirming_discard: false,
             inline_edit_editors: HashMap::default(),
@@ -2844,6 +2749,80 @@ impl Editor {
         self.go_to_review_comment_thread(Direction::Prev, window, cx);
     }
 
+    pub(super) fn current_review_comment_id(&self, cx: &App) -> Option<usize> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let cursor_row = self
+            .selections
+            .newest_anchor()
+            .head()
+            .to_point(&snapshot)
+            .row;
+        let mut best: Option<(u32, usize)> = None;
+        for (_, comments) in &self.stored_review_comments {
+            for comment in comments {
+                if comment.deleted_on.is_some() {
+                    continue;
+                }
+                let range = comment.range.to_point(&snapshot);
+                let distance = if cursor_row < range.start.row {
+                    range.start.row - cursor_row
+                } else if cursor_row > range.end.row {
+                    cursor_row - range.end.row
+                } else {
+                    0
+                };
+                if best.map_or(true, |(best_distance, _)| distance < best_distance) {
+                    best = Some((distance, comment.id));
+                }
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
+    pub(super) fn reply_to_current_review_comment(
+        &mut self,
+        _: &ReplyToComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(id) = self.current_review_comment_id(cx) {
+            self.reply_to_review_comment(&ReplyToReviewComment { id }, window, cx);
+        }
+    }
+
+    pub(super) fn edit_current_review_comment(
+        &mut self,
+        _: &EditComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(id) = self.current_review_comment_id(cx) {
+            self.edit_review_comment(&EditReviewComment { id }, window, cx);
+        }
+    }
+
+    pub(super) fn delete_current_review_comment(
+        &mut self,
+        _: &DeleteComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(id) = self.current_review_comment_id(cx) {
+            self.delete_review_comment(&DeleteReviewComment { id }, window, cx);
+        }
+    }
+
+    pub(super) fn copy_current_review_comment_reference(
+        &mut self,
+        _: &CopyCommentReference,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(id) = self.current_review_comment_id(cx) {
+            self.copy_review_comment_reference(id, false, cx);
+        }
+    }
+
     fn go_to_review_comment_thread(
         &mut self,
         direction: Direction,
@@ -3223,14 +3202,13 @@ impl Editor {
             .unwrap_or(0)
     }
 
-    fn sync_review_comment_body_editors(
+    pub(super) fn drop_review_comment_body_editors(
         &mut self,
         hunk_key: &DiffHunkKey,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let comments = self.comments_for_hunk(hunk_key, &snapshot);
         let Some(overlay_index) = self
             .diff_review_overlays
             .iter()
@@ -3239,57 +3217,12 @@ impl Editor {
             return;
         };
 
-        let comment_ids = comments
-            .iter()
-            .map(|comment| comment.id)
-            .collect::<HashSet<_>>();
-        let reply_ids = comments
-            .iter()
-            .flat_map(|comment| comment.replies.iter().map(|reply| reply.id))
-            .collect::<HashSet<_>>();
         self.diff_review_overlays[overlay_index]
             .body_editors
-            .retain(|id, _| comment_ids.contains(id));
+            .clear();
         self.diff_review_overlays[overlay_index]
             .reply_body_editors
-            .retain(|id, _| reply_ids.contains(id));
-
-        let open_editor = cx.entity().downgrade();
-        for comment in comments {
-            let needs_comment_editor = self.diff_review_overlays[overlay_index]
-                .body_editors
-                .get(&comment.id)
-                .is_none_or(|editor| editor.read(cx).text(cx) != comment.comment);
-            if needs_comment_editor {
-                let body_editor = Self::review_comment_body_editor(
-                    comment.comment.clone(),
-                    open_editor.clone(),
-                    window,
-                    cx,
-                );
-                self.diff_review_overlays[overlay_index]
-                    .body_editors
-                    .insert(comment.id, body_editor);
-            }
-
-            for reply in comment.replies {
-                let needs_reply_editor = self.diff_review_overlays[overlay_index]
-                    .reply_body_editors
-                    .get(&reply.id)
-                    .is_none_or(|editor| editor.read(cx).text(cx) != reply.comment);
-                if needs_reply_editor {
-                    let body_editor = Self::review_comment_body_editor(
-                        reply.comment.clone(),
-                        open_editor.clone(),
-                        window,
-                        cx,
-                    );
-                    self.diff_review_overlays[overlay_index]
-                        .reply_body_editors
-                        .insert(reply.id, body_editor);
-                }
-            }
-        }
+            .clear();
     }
 
     fn hunk_key_for_review_comment(&self, id: usize) -> Option<DiffHunkKey> {
@@ -3486,7 +3419,7 @@ impl Editor {
                     start..end
                 });
             if let Some(display_range) = display_range {
-                self.show_diff_review_overlay_with_prompt(display_range, false, window, cx);
+                self.show_diff_review_overlay_with_prompt(display_range, false, true, window, cx);
             }
             self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
             cx.emit(EditorEvent::ReviewCommentsChanged {
@@ -3701,6 +3634,7 @@ impl Editor {
             author: comment.author.clone(),
             created_at: comment.created_at.clone(),
             deleted_on: comment.deleted_on.clone(),
+            resolved_on: comment.resolved_on.clone(),
             file: location.file,
             side: location.side,
             hunk_line: location.hunk_line,
@@ -3732,6 +3666,26 @@ impl Editor {
     ) -> anyhow::Result<usize> {
         let restored: ReviewCommentsSnapshot =
             serde_json::from_str(json).context("deserializing review comments")?;
+
+        // Reloads (e.g. an agent writing a reply to the DB) rebuild every overlay from
+        // scratch. Remember each thread's current expand/collapse state so a reload doesn't
+        // silently re-collapse a thread the user had open.
+        let prior_snapshot = self.buffer.read(cx).snapshot(cx);
+        let prior_comments_expanded: HashMap<(Arc<util::rel_path::RelPath>, u32), bool> = self
+            .diff_review_overlays
+            .iter()
+            .map(|overlay| {
+                let row = overlay
+                    .hunk_key
+                    .hunk_start_anchor
+                    .to_point(&prior_snapshot)
+                    .row;
+                (
+                    (overlay.hunk_key.file_path.clone(), row),
+                    overlay.comments_expanded,
+                )
+            })
+            .collect();
 
         self.dismiss_all_diff_review_overlays(cx);
         self.stored_review_comments.clear();
@@ -3832,6 +3786,7 @@ impl Editor {
             let comment = StoredReviewComment {
                 created_at: saved_comment.created_at,
                 deleted_on: saved_comment.deleted_on,
+                resolved_on: saved_comment.resolved_on,
                 outdated: saved_comment.outdated,
                 outdated_reason: saved_comment.outdated_reason,
                 review_round: saved_comment.review_round,
@@ -3850,21 +3805,35 @@ impl Editor {
             restored_count += 1;
         }
 
-        let restored_ranges: Vec<_> = self
+        let restored_overlays: Vec<_> = self
             .stored_review_comments
             .iter()
-            .filter_map(|(_, comments)| {
+            .filter_map(|(hunk_key, comments)| {
                 comments
                     .iter()
                     .find(|comment| comment.deleted_on.is_none())
-                    .map(|comment| comment.range.clone())
+                    .map(|comment| (hunk_key.clone(), comment.range.clone()))
             })
             .collect();
-        for range in restored_ranges {
+        // Restored reviews open expanded by default. Threads the user already collapsed keep their
+        // state instead of falling back to this default.
+        let default_comments_expanded = true;
+        for (hunk_key, range) in restored_overlays {
             let display_snapshot = self.display_snapshot(cx);
             let start = range.start.to_display_point(&display_snapshot).row();
             let end = range.end.to_display_point(&display_snapshot).row();
-            self.show_diff_review_overlay_with_prompt(start..end, false, window, cx);
+            let row = hunk_key.hunk_start_anchor.to_point(&snapshot).row;
+            let comments_expanded = prior_comments_expanded
+                .get(&(hunk_key.file_path.clone(), row))
+                .copied()
+                .unwrap_or(default_comments_expanded);
+            self.show_diff_review_overlay_with_prompt(
+                start..end,
+                false,
+                comments_expanded,
+                window,
+                cx,
+            );
         }
 
         cx.emit(EditorEvent::ReviewCommentsChanged {
@@ -3917,6 +3886,56 @@ impl Editor {
             self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
             cx.notify();
         }
+    }
+
+    /// Expands every review comment thread, or collapses them all when each one is already open.
+    pub(super) fn toggle_all_review_comments(
+        &mut self,
+        _: &ToggleAllComments,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.diff_review_overlays.is_empty() {
+            return;
+        }
+        let expand = !self
+            .diff_review_overlays
+            .iter()
+            .all(|overlay| overlay.comments_expanded);
+        let hunk_keys: Vec<DiffHunkKey> = self
+            .diff_review_overlays
+            .iter_mut()
+            .map(|overlay| {
+                overlay.comments_expanded = expand;
+                overlay.hunk_key.clone()
+            })
+            .collect();
+        for hunk_key in hunk_keys {
+            self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Toggles the expanded state of a specific overlay, identified by its hunk. Used by the
+    /// comments-section header so clicking it always targets that overlay rather than the
+    /// focused or first one.
+    pub(super) fn toggle_review_comments_expanded_for_hunk(
+        &mut self,
+        hunk_key: &DiffHunkKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let Some(overlay) = self
+            .diff_review_overlays
+            .iter_mut()
+            .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, &snapshot))
+        else {
+            return;
+        };
+        overlay.comments_expanded = !overlay.comments_expanded;
+        self.refresh_diff_review_overlay_height(hunk_key, window, cx);
+        cx.notify();
     }
 
     /// Handles the EditReviewComment action - sets a comment into editing mode.
@@ -4410,6 +4429,122 @@ impl Editor {
             } else {
                 self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
             }
+        }
+    }
+
+    fn set_review_comment_resolved(&mut self, id: usize, resolved: bool, cx: &mut Context<Self>) {
+        let timestamp = if resolved {
+            current_review_comment_timestamp()
+        } else {
+            None
+        };
+        if let Some(comment) = self
+            .orphaned_review_comments
+            .iter_mut()
+            .find(|comment| comment.id == id)
+        {
+            comment.resolved_on = timestamp;
+        } else if let Some(comment) = self
+            .stored_review_comments
+            .iter_mut()
+            .flat_map(|(_, comments)| comments)
+            .find(|comment| comment.id == id)
+        {
+            comment.resolved_on = timestamp;
+            if !resolved {
+                comment.show_resolved = false;
+            }
+        } else {
+            return;
+        }
+        cx.emit(EditorEvent::ReviewCommentsChanged {
+            total_count: self.total_review_comment_count(),
+            persist: true,
+        });
+        cx.notify();
+    }
+
+    pub(super) fn resolve_review_comment(
+        &mut self,
+        action: &ResolveReviewComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let hunk_key = self.hunk_key_for_review_comment(action.id);
+        self.set_review_comment_resolved(action.id, true, cx);
+        if let Some(hunk_key) = hunk_key {
+            self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        }
+    }
+
+    pub(super) fn unresolve_review_comment(
+        &mut self,
+        action: &UnresolveReviewComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let hunk_key = self.hunk_key_for_review_comment(action.id);
+        self.set_review_comment_resolved(action.id, false, cx);
+        if let Some(hunk_key) = hunk_key {
+            self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        }
+    }
+
+    pub(super) fn toggle_show_resolved_review_comment(
+        &mut self,
+        action: &ToggleResolvedReviewComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let hunk_key = self.hunk_key_for_review_comment(action.id);
+        if let Some(comment) = self
+            .stored_review_comments
+            .iter_mut()
+            .flat_map(|(_, comments)| comments)
+            .find(|comment| comment.id == action.id && comment.resolved_on.is_some())
+        {
+            comment.show_resolved = !comment.show_resolved;
+            cx.notify();
+            if let Some(hunk_key) = hunk_key {
+                self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+            }
+        }
+    }
+
+    pub(super) fn resolve_current_review_comment(
+        &mut self,
+        _: &ResolveThread,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(id) = self.current_review_comment_id(cx) {
+            self.resolve_review_comment(&ResolveReviewComment { id }, window, cx);
+        }
+    }
+
+    pub(super) fn unresolve_current_review_comment(
+        &mut self,
+        _: &UnresolveThread,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(id) = self.current_review_comment_id(cx) {
+            self.unresolve_review_comment(&UnresolveReviewComment { id }, window, cx);
+        }
+    }
+
+    pub(super) fn toggle_resolved_current_review_comment(
+        &mut self,
+        _: &ToggleResolvedThread,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(id) = self.current_review_comment_id(cx) {
+            self.toggle_show_resolved_review_comment(
+                &ToggleResolvedReviewComment { id },
+                window,
+                cx,
+            );
         }
     }
 
@@ -5385,7 +5520,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.sync_review_comment_body_editors(hunk_key, window, cx);
+        self.drop_review_comment_body_editors(hunk_key, window, cx);
 
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let (comments_expanded, prompt_visible, block_id, prompt_editor) = {
@@ -5571,7 +5706,7 @@ impl Editor {
 
         let comment_count = comments.len();
         let avatar_size = px(20.);
-        let action_icon_size = IconSize::Medium;
+        let action_icon_size = IconSize::Custom(rems(20. / 16.));
 
         v_flex()
             .w_full()
@@ -5699,6 +5834,7 @@ impl Editor {
             .when(comment_count > 0, |el| {
                 el.child(Self::render_comments_section(
                     comments,
+                    hunk_key.clone(),
                     comments_expanded,
                     inline_editors,
                     inline_reply_editors,
@@ -5717,6 +5853,7 @@ impl Editor {
 
     fn render_comments_section(
         comments: Vec<StoredReviewComment>,
+        hunk_key: DiffHunkKey,
         expanded: bool,
         inline_editors: HashMap<usize, Entity<Editor>>,
         inline_reply_editors: HashMap<usize, Entity<Editor>>,
@@ -5730,6 +5867,13 @@ impl Editor {
         colors: &theme::ThemeColors,
     ) -> impl IntoElement {
         let comment_count = comments.len();
+        // Custom blocks render without a per-overlay element id, so a constant header id would
+        // collide across overlays and GPUI would drop clicks on all but one. Key it to the
+        // thread's first (stable) comment id so every header is independently clickable.
+        let header_id = format!(
+            "review-comments-header-{}",
+            comments.first().map_or(0, |c| c.id)
+        );
 
         v_flex()
             .w_full()
@@ -5737,7 +5881,7 @@ impl Editor {
             .gap_1()
             .child(
                 h_flex()
-                    .id("review-comments-header")
+                    .id(header_id)
                     .w_full()
                     .min_w_0()
                     .items_center()
@@ -5747,11 +5891,18 @@ impl Editor {
                     .cursor_pointer()
                     .rounded_md()
                     .hover(|style| style.bg(colors.ghost_element_hover))
-                    .on_click(|_, window: &mut Window, cx| {
-                        window.dispatch_action(
-                            Box::new(crate::actions::ToggleReviewCommentsExpanded),
-                            cx,
-                        );
+                    .on_click({
+                        let editor_handle = editor_handle.clone();
+                        let hunk_key = hunk_key.clone();
+                        move |_, window: &mut Window, cx| {
+                            if let Some(editor) = editor_handle.upgrade() {
+                                editor.update(cx, |editor, cx| {
+                                    editor.toggle_review_comments_expanded_for_hunk(
+                                        &hunk_key, window, cx,
+                                    );
+                                });
+                            }
+                        }
                     })
                     .child(
                         Icon::new(if expanded {
@@ -5816,6 +5967,9 @@ impl Editor {
         let is_outdated = comment.outdated;
         let outdated_reason = comment.outdated_reason.clone();
         let is_editing = inline_editor.is_some();
+        let is_resolved = comment.resolved_on.is_some();
+        let show_resolved = comment.show_resolved;
+        let reply_count = comment.replies.len();
         let cancel_editor_handle = editor_handle.clone();
         let confirm_editor_handle = editor_handle.clone();
         let edit_editor_handle = editor_handle.clone();
@@ -5825,9 +5979,124 @@ impl Editor {
         let cancel_reply_editor_handle = editor_handle.clone();
         let submit_reply_editor_handle = editor_handle.clone();
         let delete_editor_handle = editor_handle.clone();
+        let resolve_editor_handle = editor_handle.clone();
+        let unresolve_editor_handle = editor_handle.clone();
+        let toggle_resolved_editor_handle = editor_handle.clone();
         let reply_row_editor_handle = editor_handle;
         let review_comment_background = colors.element_background;
         let review_comment_border = colors.border_variant;
+
+        if is_resolved && !show_resolved && !is_editing {
+            let collapsed_preview = comment
+                .comment
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            return v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_1()
+                        .px_2()
+                        .py_1p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(review_comment_border)
+                        .bg(review_comment_background)
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .items_center()
+                                .gap_1()
+                                .child(Self::render_author_badge(
+                                    author,
+                                    user_avatar_uri.clone(),
+                                    avatar_size,
+                                    colors,
+                                ))
+                                .child(Self::render_resolved_badge(colors))
+                                .when_some(created_at.clone(), |el, created_at| {
+                                    el.child(Self::render_review_timestamp(created_at))
+                                })
+                                .when(reply_count > 0, |el| {
+                                    el.child(
+                                        Label::new(format!(
+                                            "{reply_count} repl{}",
+                                            if reply_count == 1 { "y" } else { "ies" }
+                                        ))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                    )
+                                })
+                                .child(div().mx_1p5().w_px().h_4().bg(review_comment_border))
+                                .child(
+                                    IconButton::new(
+                                        format!("diff-review-show-thread-{comment_id}"),
+                                        IconName::Eye,
+                                    )
+                                    .icon_color(ui::Color::Info)
+                                    .icon_size(action_icon_size)
+                                    .size(ButtonSize::None)
+                                    .tooltip(Tooltip::text("Show thread"))
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            if let Some(editor) =
+                                                toggle_resolved_editor_handle.upgrade()
+                                            {
+                                                editor.update(cx, |editor, cx| {
+                                                    editor.toggle_show_resolved_review_comment(
+                                                        &ToggleResolvedReviewComment {
+                                                            id: comment_id,
+                                                        },
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        },
+                                    ),
+                                )
+                                .child(
+                                    IconButton::new(
+                                        format!("diff-review-unresolve-{comment_id}"),
+                                        IconName::RotateCcw,
+                                    )
+                                    .icon_color(ui::Color::Success)
+                                    .icon_size(action_icon_size)
+                                    .size(ButtonSize::None)
+                                    .tooltip(Tooltip::text("Unresolve thread"))
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            if let Some(editor) = unresolve_editor_handle.upgrade()
+                                            {
+                                                editor.update(cx, |editor, cx| {
+                                                    editor.unresolve_review_comment(
+                                                        &UnresolveReviewComment { id: comment_id },
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        },
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div().min_w_0().child(
+                                Label::new(collapsed_preview)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                        ),
+                )
+                .into_any_element();
+        }
 
         v_flex()
             .w_full()
@@ -5859,7 +6128,7 @@ impl Editor {
                             .absolute()
                             .top_1()
                             .left_2()
-                            .gap_1()
+                            .gap_1p5()
                             .items_center()
                             .child(Self::render_author_badge(
                                 author,
@@ -5872,6 +6141,196 @@ impl Editor {
                             })
                             .when_some(created_at.clone(), |el, created_at| {
                                 el.child(Self::render_review_timestamp(created_at))
+                            })
+                            .when(is_resolved, |el| {
+                                el.child(Self::render_resolved_badge(colors))
+                            })
+                            .when(is_outdated, |el| {
+                                let reason = match outdated_reason.as_deref() {
+                                    Some("file_not_in_diff") => "file no longer has a visible diff",
+                                    Some("line_not_in_diff") => "line no longer has a visible diff",
+                                    _ => "change no longer has a visible diff",
+                                };
+                                let mut badge = h_flex()
+                                    .px_1p5()
+                                    .h_5()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(colors.border_variant)
+                                    .bg(colors.element_background)
+                                    .child(
+                                        Label::new("Outdated")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Warning),
+                                    );
+                                gpui::InteractiveElement::interactivity(&mut badge)
+                                    .tooltip(Tooltip::text(reason));
+                                el.child(badge)
+                            })
+                            .child(div().mx_1p5().w_px().h_4().bg(review_comment_border))
+                            .child(
+                                IconButton::new(
+                                    format!("diff-review-copy-reference-{comment_id}"),
+                                    IconName::Copy,
+                                )
+                                .icon_color(ui::Color::Info)
+                                .icon_size(action_icon_size)
+                                .size(ButtonSize::None)
+                                .tooltip(Tooltip::text("Copy comment reference"))
+                                .on_click(move |_, _window, cx| {
+                                    if let Some(editor) = copy_editor_handle.upgrade() {
+                                        editor.update(cx, |editor, cx| {
+                                            editor.copy_review_comment_reference(
+                                                comment_id, false, cx,
+                                            );
+                                        });
+                                    }
+                                }),
+                            )
+                            .child(
+                                IconButton::new(
+                                    format!("diff-review-reply-{comment_id}"),
+                                    IconName::ReplyArrowRight,
+                                )
+                                .icon_color(ui::Color::Default)
+                                .icon_size(action_icon_size)
+                                .size(ButtonSize::None)
+                                .tooltip(Tooltip::text("Reply"))
+                                .on_click(move |_, window, cx| {
+                                    if let Some(editor) = reply_editor_handle.upgrade() {
+                                        editor.update(cx, |editor, cx| {
+                                            editor.reply_to_review_comment(
+                                                &crate::actions::ReplyToReviewComment {
+                                                    id: comment_id,
+                                                },
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                }),
+                            )
+                            .child(
+                                IconButton::new(
+                                    format!("diff-review-edit-{comment_id}"),
+                                    IconName::Pencil,
+                                )
+                                .icon_color(ui::Color::Modified)
+                                .icon_size(action_icon_size)
+                                .size(ButtonSize::None)
+                                .tooltip(Tooltip::text("Edit comment"))
+                                .on_click(move |_, window, cx| {
+                                    if let Some(editor) = edit_editor_handle.upgrade() {
+                                        editor.update(cx, |editor, cx| {
+                                            editor.edit_review_comment(
+                                                &crate::actions::EditReviewComment {
+                                                    id: comment_id,
+                                                },
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                }),
+                            )
+                            .child(
+                                IconButton::new(
+                                    format!("diff-review-delete-{comment_id}"),
+                                    IconName::Trash,
+                                )
+                                .icon_color(ui::Color::Error)
+                                .icon_size(action_icon_size)
+                                .size(ButtonSize::None)
+                                .tooltip(Tooltip::text("Delete comment"))
+                                .on_click(move |_, window, cx| {
+                                    if let Some(editor) = delete_editor_handle.upgrade() {
+                                        editor.update(cx, |editor, cx| {
+                                            editor.delete_review_comment(
+                                                &DeleteReviewComment { id: comment_id },
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                }),
+                            )
+                            .when(!is_resolved, |el| {
+                                el.child(
+                                    IconButton::new(
+                                        format!("diff-review-resolve-{comment_id}"),
+                                        IconName::Check,
+                                    )
+                                    .icon_color(ui::Color::Success)
+                                    .icon_size(action_icon_size)
+                                    .size(ButtonSize::None)
+                                    .tooltip(Tooltip::text("Resolve thread"))
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            if let Some(editor) = resolve_editor_handle.upgrade() {
+                                                editor.update(cx, |editor, cx| {
+                                                    editor.resolve_review_comment(
+                                                        &ResolveReviewComment { id: comment_id },
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        },
+                                    ),
+                                )
+                            })
+                            .when(is_resolved, |el| {
+                                el.child(
+                                    IconButton::new(
+                                        format!("diff-review-hide-thread-{comment_id}"),
+                                        IconName::EyeOff,
+                                    )
+                                    .icon_color(ui::Color::Info)
+                                    .icon_size(action_icon_size)
+                                    .size(ButtonSize::None)
+                                    .tooltip(Tooltip::text("Collapse resolved thread"))
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            if let Some(editor) =
+                                                toggle_resolved_editor_handle.upgrade()
+                                            {
+                                                editor.update(cx, |editor, cx| {
+                                                    editor.toggle_show_resolved_review_comment(
+                                                        &ToggleResolvedReviewComment {
+                                                            id: comment_id,
+                                                        },
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        },
+                                    ),
+                                )
+                                .child(
+                                    IconButton::new(
+                                        format!("diff-review-unresolve-expanded-{comment_id}"),
+                                        IconName::RotateCcw,
+                                    )
+                                    .icon_color(ui::Color::Success)
+                                    .icon_size(action_icon_size)
+                                    .size(ButtonSize::None)
+                                    .tooltip(Tooltip::text("Unresolve thread"))
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            if let Some(editor) = unresolve_editor_handle.upgrade()
+                                            {
+                                                editor.update(cx, |editor, cx| {
+                                                    editor.unresolve_review_comment(
+                                                        &UnresolveReviewComment { id: comment_id },
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        },
+                                    ),
+                                )
                             })
                             .into_any_element()
                     })
@@ -5903,164 +6362,54 @@ impl Editor {
                             })
                             .into_any_element()
                     })
-                    .child(if is_editing {
-                        h_flex()
-                            .flex_shrink_0()
-                            .gap_1()
-                            .child(
-                                IconButton::new(
-                                    format!("diff-review-cancel-edit-{comment_id}"),
-                                    IconName::Close,
+                    .when(is_editing, |row| {
+                        row.child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .gap_1()
+                                .child(
+                                    IconButton::new(
+                                        format!("diff-review-cancel-edit-{comment_id}"),
+                                        IconName::Close,
+                                    )
+                                    .icon_color(ui::Color::Muted)
+                                    .icon_size(action_icon_size)
+                                    .size(ButtonSize::Medium)
+                                    .tooltip(Tooltip::text("Cancel"))
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            if let Some(editor) = cancel_editor_handle.upgrade() {
+                                                editor.update(cx, |editor, cx| {
+                                                    editor.cancel_edit_review_comment(
+                                                        comment_id, window, cx,
+                                                    );
+                                                });
+                                            }
+                                        },
+                                    ),
                                 )
-                                .icon_color(ui::Color::Muted)
-                                .icon_size(action_icon_size)
-                                .size(ButtonSize::Medium)
-                                .tooltip(Tooltip::text("Cancel"))
-                                .on_click(move |_, window, cx| {
-                                    if let Some(editor) = cancel_editor_handle.upgrade() {
-                                        editor.update(cx, |editor, cx| {
-                                            editor
-                                                .cancel_edit_review_comment(comment_id, window, cx);
-                                        });
-                                    }
-                                }),
-                            )
-                            .child(
-                                IconButton::new(
-                                    format!("diff-review-confirm-edit-{comment_id}"),
-                                    IconName::Return,
-                                )
-                                .icon_color(ui::Color::Muted)
-                                .icon_size(action_icon_size)
-                                .size(ButtonSize::Medium)
-                                .tooltip(Tooltip::text("Confirm"))
-                                .on_click(move |_, window, cx| {
-                                    if let Some(editor) = confirm_editor_handle.upgrade() {
-                                        editor.update(cx, |editor, cx| {
-                                            editor.confirm_edit_review_comment(
-                                                comment_id, window, cx,
-                                            );
-                                        });
-                                    }
-                                }),
-                            )
-                            .into_any_element()
-                    } else {
-                        h_flex()
-                            .absolute()
-                            .top_1()
-                            .right_2()
-                            .flex_shrink_0()
-                            .gap_1()
-                            .when(is_outdated, |el| {
-                                let reason = match outdated_reason.as_deref() {
-                                    Some("file_not_in_diff") => "file no longer has a visible diff",
-                                    Some("line_not_in_diff") => "line no longer has a visible diff",
-                                    _ => "change no longer has a visible diff",
-                                };
-                                let mut badge = h_flex()
-                                    .px_1p5()
-                                    .h_5()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(colors.border_variant)
-                                    .bg(colors.element_background)
-                                    .child(
-                                        Label::new("Outdated")
-                                            .size(LabelSize::Small)
-                                            .color(Color::Warning),
-                                    );
-                                gpui::InteractiveElement::interactivity(&mut badge)
-                                    .tooltip(Tooltip::text(reason));
-                                el.child(badge)
-                            })
-                            .child(
-                                IconButton::new(
-                                    format!("diff-review-copy-reference-{comment_id}"),
-                                    IconName::Copy,
-                                )
-                                .icon_color(ui::Color::Muted)
-                                .icon_size(action_icon_size)
-                                .size(ButtonSize::Medium)
-                                .tooltip(Tooltip::text("Copy comment reference"))
-                                .on_click(move |_, _window, cx| {
-                                    if let Some(editor) = copy_editor_handle.upgrade() {
-                                        editor.update(cx, |editor, cx| {
-                                            editor.copy_review_comment_reference(
-                                                comment_id, false, cx,
-                                            );
-                                        });
-                                    }
-                                }),
-                            )
-                            .child(
-                                IconButton::new(
-                                    format!("diff-review-reply-{comment_id}"),
-                                    IconName::ReplyArrowRight,
-                                )
-                                .icon_color(ui::Color::Muted)
-                                .icon_size(action_icon_size)
-                                .size(ButtonSize::Medium)
-                                .tooltip(Tooltip::text("Reply"))
-                                .on_click(move |_, window, cx| {
-                                    if let Some(editor) = reply_editor_handle.upgrade() {
-                                        editor.update(cx, |editor, cx| {
-                                            editor.reply_to_review_comment(
-                                                &crate::actions::ReplyToReviewComment {
-                                                    id: comment_id,
-                                                },
-                                                window,
-                                                cx,
-                                            );
-                                        });
-                                    }
-                                }),
-                            )
-                            .child(
-                                IconButton::new(
-                                    format!("diff-review-edit-{comment_id}"),
-                                    IconName::Pencil,
-                                )
-                                .icon_color(ui::Color::Muted)
-                                .icon_size(action_icon_size)
-                                .size(ButtonSize::Medium)
-                                .tooltip(Tooltip::text("Edit comment"))
-                                .on_click(move |_, window, cx| {
-                                    if let Some(editor) = edit_editor_handle.upgrade() {
-                                        editor.update(cx, |editor, cx| {
-                                            editor.edit_review_comment(
-                                                &crate::actions::EditReviewComment {
-                                                    id: comment_id,
-                                                },
-                                                window,
-                                                cx,
-                                            );
-                                        });
-                                    }
-                                }),
-                            )
-                            .child(
-                                IconButton::new(
-                                    format!("diff-review-delete-{comment_id}"),
-                                    IconName::Trash,
-                                )
-                                .icon_color(ui::Color::Muted)
-                                .icon_size(action_icon_size)
-                                .size(ButtonSize::Medium)
-                                .tooltip(Tooltip::text("Delete comment"))
-                                .on_click(move |_, window, cx| {
-                                    if let Some(editor) = delete_editor_handle.upgrade() {
-                                        editor.update(cx, |editor, cx| {
-                                            editor.delete_review_comment(
-                                                &DeleteReviewComment { id: comment_id },
-                                                window,
-                                                cx,
-                                            );
-                                        });
-                                    }
-                                }),
-                            )
-                            .into_any_element()
+                                .child(
+                                    IconButton::new(
+                                        format!("diff-review-confirm-edit-{comment_id}"),
+                                        IconName::Return,
+                                    )
+                                    .icon_color(ui::Color::Muted)
+                                    .icon_size(action_icon_size)
+                                    .size(ButtonSize::Medium)
+                                    .tooltip(Tooltip::text("Confirm"))
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            if let Some(editor) = confirm_editor_handle.upgrade() {
+                                                editor.update(cx, |editor, cx| {
+                                                    editor.confirm_edit_review_comment(
+                                                        comment_id, window, cx,
+                                                    );
+                                                });
+                                            }
+                                        },
+                                    ),
+                                ),
+                        )
                     }),
             )
             .children(comment.replies.into_iter().map(|reply| {
@@ -6102,7 +6451,7 @@ impl Editor {
                             .absolute()
                             .top_1()
                             .left_2()
-                            .gap_1()
+                            .gap_1p5()
                             .items_center()
                             .child(Self::render_author_badge(
                                 reply.author,
@@ -6116,6 +6465,83 @@ impl Editor {
                             .when_some(reply_created_at.clone(), |el, created_at| {
                                 el.child(Self::render_review_timestamp(created_at))
                             })
+                            .child(div().mx_1p5().w_px().h_4().bg(review_comment_border))
+                            .child(
+                                IconButton::new(
+                                    format!("diff-review-copy-reply-reference-{reply_id}"),
+                                    IconName::Copy,
+                                )
+                                .icon_color(ui::Color::Info)
+                                .icon_size(action_icon_size)
+                                .size(ButtonSize::None)
+                                .tooltip(Tooltip::text("Copy reply reference"))
+                                .on_click(move |_, _window, cx| {
+                                    if let Some(editor) = copy_reply_handle.upgrade() {
+                                        editor.update(cx, |editor, cx| {
+                                            editor
+                                                .copy_review_comment_reference(reply_id, true, cx);
+                                        });
+                                    }
+                                }),
+                            )
+                            .child(
+                                IconButton::new(
+                                    format!("diff-review-reply-to-reply-{reply_id}"),
+                                    IconName::ReplyArrowRight,
+                                )
+                                .icon_color(ui::Color::Default)
+                                .icon_size(action_icon_size)
+                                .size(ButtonSize::None)
+                                .tooltip(Tooltip::text("Reply"))
+                                .on_click(move |_, window, cx| {
+                                    if let Some(editor) = reply_to_thread_handle.upgrade() {
+                                        editor.update(cx, |editor, cx| {
+                                            editor.reply_to_review_comment(
+                                                &crate::actions::ReplyToReviewComment {
+                                                    id: comment_id,
+                                                },
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                }),
+                            )
+                            .child(
+                                IconButton::new(
+                                    format!("diff-review-edit-reply-{reply_id}"),
+                                    IconName::Pencil,
+                                )
+                                .icon_color(ui::Color::Modified)
+                                .icon_size(action_icon_size)
+                                .size(ButtonSize::None)
+                                .tooltip(Tooltip::text("Edit reply"))
+                                .on_click(move |_, window, cx| {
+                                    if let Some(editor) = edit_reply_handle.upgrade() {
+                                        editor.update(cx, |editor, cx| {
+                                            editor.edit_review_reply(reply_id, window, cx);
+                                        });
+                                    }
+                                }),
+                            )
+                            .child(
+                                IconButton::new(
+                                    format!("diff-review-delete-reply-{reply_id}"),
+                                    IconName::Trash,
+                                )
+                                .icon_color(ui::Color::Error)
+                                .icon_size(action_icon_size)
+                                .size(ButtonSize::None)
+                                .tooltip(Tooltip::text("Delete reply"))
+                                .on_click(move |_, window, cx| {
+                                    if let Some(editor) = delete_reply_handle.upgrade() {
+                                        editor.update(cx, |editor, cx| {
+                                            editor
+                                                .confirm_delete_review_reply(reply_id, window, cx);
+                                        });
+                                    }
+                                }),
+                            )
                             .into_any_element()
                     })
                     .child(if let Some(editor) = inline_reply_editor {
@@ -6146,129 +6572,57 @@ impl Editor {
                             })
                             .into_any_element()
                     })
-                    .child(if is_editing_reply {
-                        h_flex()
-                            .flex_shrink_0()
-                            .gap_1()
-                            .child(
-                                IconButton::new(
-                                    format!("diff-review-cancel-reply-edit-{reply_id}"),
-                                    IconName::Close,
+                    .when(is_editing_reply, |row| {
+                        row.child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .gap_1()
+                                .child(
+                                    IconButton::new(
+                                        format!("diff-review-cancel-reply-edit-{reply_id}"),
+                                        IconName::Close,
+                                    )
+                                    .icon_color(ui::Color::Muted)
+                                    .icon_size(action_icon_size)
+                                    .size(ButtonSize::Medium)
+                                    .tooltip(Tooltip::text("Cancel"))
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            if let Some(editor) = cancel_reply_edit_handle.upgrade()
+                                            {
+                                                editor.update(cx, |editor, cx| {
+                                                    editor.cancel_edit_review_reply(
+                                                        reply_id, window, cx,
+                                                    );
+                                                });
+                                            }
+                                        },
+                                    ),
                                 )
-                                .icon_color(ui::Color::Muted)
-                                .icon_size(action_icon_size)
-                                .size(ButtonSize::Medium)
-                                .tooltip(Tooltip::text("Cancel"))
-                                .on_click(move |_, window, cx| {
-                                    if let Some(editor) = cancel_reply_edit_handle.upgrade() {
-                                        editor.update(cx, |editor, cx| {
-                                            editor.cancel_edit_review_reply(reply_id, window, cx);
-                                        });
-                                    }
-                                }),
-                            )
-                            .child(
-                                IconButton::new(
-                                    format!("diff-review-confirm-reply-edit-{reply_id}"),
-                                    IconName::Return,
-                                )
-                                .icon_color(ui::Color::Muted)
-                                .icon_size(action_icon_size)
-                                .size(ButtonSize::Medium)
-                                .tooltip(Tooltip::text("Confirm"))
-                                .on_click(move |_, window, cx| {
-                                    if let Some(editor) = confirm_reply_edit_handle.upgrade() {
-                                        editor.update(cx, |editor, cx| {
-                                            editor.confirm_edit_review_reply(reply_id, window, cx);
-                                        });
-                                    }
-                                }),
-                            )
-                            .into_any_element()
-                    } else {
-                        h_flex()
-                            .absolute()
-                            .top_1()
-                            .right_2()
-                            .flex_shrink_0()
-                            .gap_1()
-                            .child(
-                                IconButton::new(
-                                    format!("diff-review-copy-reply-reference-{reply_id}"),
-                                    IconName::Copy,
-                                )
-                                .icon_color(ui::Color::Muted)
-                                .icon_size(action_icon_size)
-                                .size(ButtonSize::Medium)
-                                .tooltip(Tooltip::text("Copy reply reference"))
-                                .on_click(move |_, _window, cx| {
-                                    if let Some(editor) = copy_reply_handle.upgrade() {
-                                        editor.update(cx, |editor, cx| {
-                                            editor
-                                                .copy_review_comment_reference(reply_id, true, cx);
-                                        });
-                                    }
-                                }),
-                            )
-                            .child(
-                                IconButton::new(
-                                    format!("diff-review-reply-to-reply-{reply_id}"),
-                                    IconName::ReplyArrowRight,
-                                )
-                                .icon_color(ui::Color::Muted)
-                                .icon_size(action_icon_size)
-                                .size(ButtonSize::Medium)
-                                .tooltip(Tooltip::text("Reply"))
-                                .on_click(move |_, window, cx| {
-                                    if let Some(editor) = reply_to_thread_handle.upgrade() {
-                                        editor.update(cx, |editor, cx| {
-                                            editor.reply_to_review_comment(
-                                                &crate::actions::ReplyToReviewComment {
-                                                    id: comment_id,
-                                                },
-                                                window,
-                                                cx,
-                                            );
-                                        });
-                                    }
-                                }),
-                            )
-                            .child(
-                                IconButton::new(
-                                    format!("diff-review-edit-reply-{reply_id}"),
-                                    IconName::Pencil,
-                                )
-                                .icon_color(ui::Color::Muted)
-                                .icon_size(action_icon_size)
-                                .size(ButtonSize::Medium)
-                                .tooltip(Tooltip::text("Edit reply"))
-                                .on_click(move |_, window, cx| {
-                                    if let Some(editor) = edit_reply_handle.upgrade() {
-                                        editor.update(cx, |editor, cx| {
-                                            editor.edit_review_reply(reply_id, window, cx);
-                                        });
-                                    }
-                                }),
-                            )
-                            .child(
-                                IconButton::new(
-                                    format!("diff-review-delete-reply-{reply_id}"),
-                                    IconName::Trash,
-                                )
-                                .icon_color(ui::Color::Muted)
-                                .icon_size(action_icon_size)
-                                .size(ButtonSize::Medium)
-                                .tooltip(Tooltip::text("Delete reply"))
-                                .on_click(move |_, window, cx| {
-                                    if let Some(editor) = delete_reply_handle.upgrade() {
-                                        editor.update(cx, |editor, cx| {
-                                            editor
-                                                .confirm_delete_review_reply(reply_id, window, cx);
-                                        });
-                                    }
-                                }),
-                            )
-                            .into_any_element()
+                                .child(
+                                    IconButton::new(
+                                        format!("diff-review-confirm-reply-edit-{reply_id}"),
+                                        IconName::Return,
+                                    )
+                                    .icon_color(ui::Color::Muted)
+                                    .icon_size(action_icon_size)
+                                    .size(ButtonSize::Medium)
+                                    .tooltip(Tooltip::text("Confirm"))
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            if let Some(editor) =
+                                                confirm_reply_edit_handle.upgrade()
+                                            {
+                                                editor.update(cx, |editor, cx| {
+                                                    editor.confirm_edit_review_reply(
+                                                        reply_id, window, cx,
+                                                    );
+                                                });
+                                            }
+                                        },
+                                    ),
+                                ),
+                        )
                     })
             }))
             .when_some(reply_editor, |el, reply_editor| {
@@ -6549,6 +6903,27 @@ impl Editor {
                 Label::new(format!("Review #{round}"))
                     .size(LabelSize::Small)
                     .color(Color::Muted),
+            )
+    }
+
+    fn render_resolved_badge(colors: &theme::ThemeColors) -> impl IntoElement {
+        h_flex()
+            .px_1p5()
+            .h_5()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border_variant)
+            .bg(colors.element_background)
+            .child(
+                Icon::new(IconName::Check)
+                    .size(IconSize::XSmall)
+                    .color(Color::Success),
+            )
+            .child(
+                Label::new("Resolved")
+                    .size(LabelSize::Small)
+                    .color(Color::Success),
             )
     }
 
