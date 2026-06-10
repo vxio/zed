@@ -191,3 +191,5 @@ Rules emerge from validated patterns, not one-off observations. The workflow is:
 # Zed Fork Sync
 
 When asked to update or sync this fork with upstream Zed and the worktree has local changes, always commit the local changes first, then run the fork sync workflow. Do not stash or discard the changes unless Vince explicitly asks for that instead.
+
+Run `zed_sync_fork` and `./script/bundle-mac -i` with a timeout long enough for a full Zed build and install. Do not stop them at the default 5-minute command limit unless they are clearly stuck with no compile/install progress.
