@@ -363,6 +363,17 @@ pub(super) struct StoredReviewReply {
     pub(super) review_round: Option<u32>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrphanedReviewCommentSummary {
+    pub id: usize,
+    pub file: String,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub body: String,
+    pub outdated_reason: Option<String>,
+    pub reply_count: usize,
+}
+
 #[derive(Clone)]
 pub(super) struct DiffReviewEditorCancel {
     parent: WeakEntity<Editor>,
@@ -1547,17 +1558,22 @@ impl Editor {
         });
     }
 
+    // Returned subscription must be stored alongside the overlay; detaching it would
+    // leak the captured editor entity in the window's focus-listener list for the
+    // lifetime of the diff view.
+    #[must_use]
     fn install_review_comment_insert_mode_handler(
         editor: &Entity<Editor>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Subscription {
         let focus_handle = editor.focus_handle(cx);
-        let editor = editor.clone();
+        let editor = editor.downgrade();
         cx.on_focus_in(&focus_handle, window, move |_, window, cx| {
-            Self::focus_review_comment_editor(&editor, window, cx);
+            if let Some(editor) = editor.upgrade() {
+                Self::focus_review_comment_editor(&editor, window, cx);
+            }
         })
-        .detach();
     }
 
     fn review_comment_prompt_focus_out_subscription(
@@ -2162,7 +2178,8 @@ impl Editor {
             editor
         });
         Self::attach_review_comment_completion_provider(completion_project, &prompt_editor, cx);
-        Self::install_review_comment_insert_mode_handler(&prompt_editor, window, cx);
+        let insert_mode_subscription =
+            Self::install_review_comment_insert_mode_handler(&prompt_editor, window, cx);
 
         let parent_editor = cx.entity().downgrade();
         let enter_subscription = Self::review_comment_enter_subscription(&prompt_editor, cx, {
@@ -2208,7 +2225,7 @@ impl Editor {
                     Subscription::join(confirm_subscription, cancel_subscription),
                     enter_subscription,
                 ),
-                focus_out_subscription,
+                Subscription::join(focus_out_subscription, insert_mode_subscription),
             )
         });
 
@@ -3561,6 +3578,22 @@ impl Editor {
         self.review_comments_json_with_deleted(true)
     }
 
+    pub fn orphaned_review_comment_summaries(&self) -> Vec<OrphanedReviewCommentSummary> {
+        self.orphaned_review_comments
+            .iter()
+            .filter(|comment| comment.deleted_on.is_none())
+            .map(|comment| OrphanedReviewCommentSummary {
+                id: comment.id,
+                file: comment.file.clone(),
+                line_start: comment.line_start,
+                line_end: comment.line_end,
+                body: comment.body.clone(),
+                outdated_reason: comment.outdated_reason.clone(),
+                reply_count: comment.replies.len(),
+            })
+            .collect()
+    }
+
     fn active_review_comments_json(&self, _cx: &App) -> anyhow::Result<String> {
         self.review_comments_json_with_deleted(false)
     }
@@ -3989,7 +4022,11 @@ impl Editor {
                         &inline_editor,
                         cx,
                     );
-                    Self::install_review_comment_insert_mode_handler(&inline_editor, window, cx);
+                    let insert_mode_subscription = Self::install_review_comment_insert_mode_handler(
+                        &inline_editor,
+                        window,
+                        cx,
+                    );
 
                     let enter_subscription =
                         Self::review_comment_enter_subscription(&inline_editor, cx, {
@@ -4025,7 +4062,7 @@ impl Editor {
                         });
                         Subscription::join(
                             Subscription::join(confirm_subscription, cancel_subscription),
-                            enter_subscription,
+                            Subscription::join(enter_subscription, insert_mode_subscription),
                         )
                     });
 
@@ -4078,7 +4115,8 @@ impl Editor {
                 editor
             });
             Self::attach_review_comment_completion_provider(completion_project, &reply_editor, cx);
-            Self::install_review_comment_insert_mode_handler(&reply_editor, window, cx);
+            let insert_mode_subscription =
+                Self::install_review_comment_insert_mode_handler(&reply_editor, window, cx);
 
             let enter_subscription = Self::review_comment_enter_subscription(&reply_editor, cx, {
                 let parent_editor = parent_editor.clone();
@@ -4113,7 +4151,7 @@ impl Editor {
                 });
                 Subscription::join(
                     Subscription::join(submit_subscription, cancel_subscription),
-                    enter_subscription,
+                    Subscription::join(enter_subscription, insert_mode_subscription),
                 )
             });
 
@@ -4595,7 +4633,11 @@ impl Editor {
                         &inline_editor,
                         cx,
                     );
-                    Self::install_review_comment_insert_mode_handler(&inline_editor, window, cx);
+                    let insert_mode_subscription = Self::install_review_comment_insert_mode_handler(
+                        &inline_editor,
+                        window,
+                        cx,
+                    );
 
                     let enter_subscription =
                         Self::review_comment_enter_subscription(&inline_editor, cx, {
@@ -4631,7 +4673,7 @@ impl Editor {
                         });
                         Subscription::join(
                             Subscription::join(confirm_subscription, cancel_subscription),
-                            enter_subscription,
+                            Subscription::join(enter_subscription, insert_mode_subscription),
                         )
                     });
 

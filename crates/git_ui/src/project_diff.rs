@@ -8,7 +8,8 @@ use anyhow::{Context as _, Result, anyhow};
 use buffer_diff::{BufferDiff, DiffHunkSecondaryStatus};
 use collections::HashMap;
 use editor::{
-    Addon, Editor, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
+    Addon, Editor, EditorEvent, EditorSettings, OrphanedReviewCommentSummary, SelectionEffects,
+    SplittableEditor,
     actions::{GoToHunk, GoToPreviousHunk, SendReviewToAgent},
     multibuffer_context_lines,
     scroll::Autoscroll,
@@ -117,6 +118,7 @@ pub struct ProjectDiff {
     loaded_review_comments_json: Option<String>,
     last_review_comments_db_modified_on: Option<SystemTime>,
     restoring_review_comments: bool,
+    review_comments_fully_restored: bool,
     _task: Task<Result<()>>,
     _review_comments_poll_task: Task<()>,
     _subscription: Subscription,
@@ -848,6 +850,20 @@ impl ProjectDiff {
     }
 
     fn restore_review_comments_if_needed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.restore_review_comments_impl(false, window, cx)
+    }
+
+    // `reattach` re-runs the restore even when the persisted JSON is unchanged, so
+    // comments that previously failed to attach (their file or line wasn't in the
+    // diff yet) get another chance after the diff finishes loading. Only the
+    // post-refresh path passes true; the periodic poll must not, otherwise an
+    // unattachable comment would tear down and rebuild every overlay each tick.
+    fn restore_review_comments_impl(
+        &mut self,
+        reattach: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(workspace_id) = self
             .workspace
             .upgrade()
@@ -859,9 +875,11 @@ impl ProjectDiff {
             return;
         };
 
+        let force_reattach = reattach && !self.review_comments_fully_restored;
         let db = persistence::ProjectDiffDb::global(cx);
         let db_modified_on = db.modified_on();
-        if db_modified_on.is_some()
+        if !force_reattach
+            && db_modified_on.is_some()
             && self.loaded_review_comments_key.as_ref() == Some(&review_key)
             && self.last_review_comments_db_modified_on == db_modified_on
         {
@@ -893,9 +911,11 @@ impl ProjectDiff {
                 }
             }
         }
-        if self.loaded_review_comments_key.as_ref() == Some(&review_key)
+        if !force_reattach
+            && self.loaded_review_comments_key.as_ref() == Some(&review_key)
             && self.loaded_review_comments_json.as_deref() == comments_json.as_deref()
         {
+            self.last_review_comments_db_modified_on = db_modified_on;
             return;
         }
         if self
@@ -932,16 +952,18 @@ impl ProjectDiff {
             })
         });
         self.restoring_review_comments = false;
-        if loaded {
-            self.last_review_comments_db_modified_on = db_modified_on;
-            if loaded_key != review_key {
-                if let Some(comments_json) = comments_json.clone() {
-                    self.persist_review_comments(comments_json, cx);
-                }
+        // Cache the attempt even when some comments failed to attach; refresh()
+        // retries attachment explicitly. Re-restoring from the poll instead would
+        // rebuild every overlay once a second and leak the editors they create.
+        self.review_comments_fully_restored = loaded;
+        self.last_review_comments_db_modified_on = db_modified_on;
+        if loaded_key != review_key {
+            if let Some(comments_json) = comments_json.clone() {
+                self.persist_review_comments(comments_json, cx);
             }
-            self.loaded_review_comments_key = Some(review_key);
-            self.loaded_review_comments_json = comments_json;
         }
+        self.loaded_review_comments_key = Some(review_key);
+        self.loaded_review_comments_json = comments_json;
     }
 
     #[cfg(test)]
@@ -1165,6 +1187,7 @@ impl ProjectDiff {
             loaded_review_comments_json: None,
             last_review_comments_db_modified_on: None,
             restoring_review_comments: false,
+            review_comments_fully_restored: true,
             _task: task,
             _review_comments_poll_task: review_comments_poll_task,
             _subscription: Subscription::join(
@@ -1614,7 +1637,7 @@ impl ProjectDiff {
         db.flush_writes().await?;
         cx.update(|window, cx| {
             this.update(cx, |this, cx| {
-                this.restore_review_comments_if_needed(window, cx);
+                this.restore_review_comments_impl(true, window, cx);
             })
         })??;
 
@@ -2161,6 +2184,12 @@ impl Render for ProjectDiff {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_empty = self.multibuffer.read(cx).is_empty();
         let is_loading = self.branch_diff.read(cx).is_tree_base_loading() || !self._task.is_ready();
+        let orphaned_review_comments = self
+            .editor
+            .read(cx)
+            .rhs_editor()
+            .read(cx)
+            .orphaned_review_comment_summaries();
 
         let is_branch_diff_view = matches!(self.diff_base(cx), DiffBase::Merge { .. });
 
@@ -2198,43 +2227,160 @@ impl Render for ProjectDiff {
                 let keybinding_focus_handle = self.focus_handle(cx);
                 el.child(
                     v_flex()
+                        .size_full()
                         .gap_1()
-                        .child(
-                            h_flex()
-                                .justify_around()
-                                .child(Label::new("No uncommitted changes")),
-                        )
-                        .map(|el| match remote_button {
-                            Some(button) => el.child(h_flex().justify_around().child(button)),
-                            None => el.child(
-                                h_flex()
-                                    .justify_around()
-                                    .child(Label::new("Remote up to date")),
-                            ),
+                        .when(!orphaned_review_comments.is_empty(), |el| {
+                            el.child(Self::render_orphaned_review_comments(
+                                orphaned_review_comments.clone(),
+                                cx,
+                            ))
                         })
                         .child(
-                            h_flex().justify_around().mt_1().child(
-                                Button::new("project-diff-close-button", "Close")
-                                    // .style(ButtonStyle::Transparent)
-                                    .key_binding(KeyBinding::for_action_in(
-                                        &CloseActiveItem::default(),
-                                        &keybinding_focus_handle,
-                                        cx,
-                                    ))
-                                    .on_click(move |_, window, cx| {
-                                        window.focus(&keybinding_focus_handle, cx);
-                                        window.dispatch_action(
-                                            Box::new(CloseActiveItem::default()),
-                                            cx,
-                                        );
-                                    }),
-                            ),
+                            v_flex()
+                                .flex_1()
+                                .items_center()
+                                .justify_center()
+                                .gap_1()
+                                .child(
+                                    h_flex()
+                                        .justify_around()
+                                        .child(Label::new("No uncommitted changes")),
+                                )
+                                .map(|el| match remote_button {
+                                    Some(button) => {
+                                        el.child(h_flex().justify_around().child(button))
+                                    }
+                                    None => el.child(
+                                        h_flex()
+                                            .justify_around()
+                                            .child(Label::new("Remote up to date")),
+                                    ),
+                                })
+                                .child(
+                                    h_flex().justify_around().mt_1().child(
+                                        Button::new("project-diff-close-button", "Close")
+                                            .key_binding(KeyBinding::for_action_in(
+                                                &CloseActiveItem::default(),
+                                                &keybinding_focus_handle,
+                                                cx,
+                                            ))
+                                            .on_click(move |_, window, cx| {
+                                                window.focus(&keybinding_focus_handle, cx);
+                                                window.dispatch_action(
+                                                    Box::new(CloseActiveItem::default()),
+                                                    cx,
+                                                );
+                                            }),
+                                    ),
+                                ),
                         ),
                 )
             })
             .when(!is_empty, |el| {
-                el.child(v_flex().size_full().child(self.editor.clone()))
+                el.child(
+                    v_flex()
+                        .size_full()
+                        .when(!orphaned_review_comments.is_empty(), |el| {
+                            el.child(Self::render_orphaned_review_comments(
+                                orphaned_review_comments,
+                                cx,
+                            ))
+                        })
+                        .child(self.editor.clone()),
+                )
             })
+    }
+}
+
+impl ProjectDiff {
+    fn render_orphaned_review_comments(
+        comments: Vec<OrphanedReviewCommentSummary>,
+        cx: &App,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let count = comments.len();
+        let title = format!(
+            "{} outdated review comment{} no longer {} a visible diff",
+            count,
+            if count == 1 { "" } else { "s" },
+            if count == 1 { "has" } else { "have" }
+        );
+
+        v_flex()
+            .w_full()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(colors.border_variant)
+            .bg(colors.editor_background)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Icon::new(IconName::Warning)
+                            .size(IconSize::Small)
+                            .color(Color::Warning),
+                    )
+                    .child(Label::new(title).size(LabelSize::Small).color(Color::Muted)),
+            )
+            .children(comments.into_iter().map(|comment| {
+                let line = if comment.line_start == comment.line_end {
+                    format!("{}:{}", comment.file, comment.line_start)
+                } else {
+                    format!(
+                        "{}:{}-{}",
+                        comment.file, comment.line_start, comment.line_end
+                    )
+                };
+                let reason = match comment.outdated_reason.as_deref() {
+                    Some("file_not_in_diff") => "file no longer has a visible diff",
+                    Some("line_not_in_diff") => "line no longer has a visible diff",
+                    _ => "change no longer has a visible diff",
+                };
+                let reply_label = match comment.reply_count {
+                    0 => None,
+                    1 => Some("1 reply".to_string()),
+                    count => Some(format!("{count} replies")),
+                };
+
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_0p5()
+                    .px_2()
+                    .py_1p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border_variant)
+                    .bg(colors.element_background)
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .child(Label::new(line).size(LabelSize::Small).color(Color::Muted))
+                            .child(
+                                Label::new("Outdated")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Warning),
+                            )
+                            .child(
+                                Label::new(reason)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .when_some(reply_label, |el, reply_label| {
+                                el.child(
+                                    Label::new(reply_label)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                            }),
+                    )
+                    .child(Label::new(comment.body).size(LabelSize::Small))
+            }))
+            .into_any_element()
     }
 }
 
@@ -3852,7 +3998,11 @@ mod tests {
             diff.update(cx, |diff, cx| {
                 diff.loaded_review_comments_key = None;
                 diff.restore_review_comments_if_needed(window, cx);
-                assert!(diff.loaded_review_comments_key.is_none());
+                // The attempt is cached so the periodic poll doesn't rebuild the
+                // overlays every tick, but it's marked incomplete so refresh()
+                // retries attaching the unmapped comment.
+                assert_eq!(diff.loaded_review_comments_key.as_ref(), Some(&review_key));
+                assert!(!diff.review_comments_fully_restored);
             })
         });
 
@@ -4156,6 +4306,17 @@ mod tests {
 
         reopened_diff.read_with(cx, |diff, _cx| {
             assert_eq!(diff.review_comment_count, 1);
+        });
+        reopened_editor.read_with(cx, |editor, _cx| {
+            let orphaned = editor.orphaned_review_comment_summaries();
+            assert_eq!(orphaned.len(), 1);
+            assert_eq!(orphaned[0].file, "foo.txt");
+            assert_eq!(orphaned[0].line_start, 1);
+            assert_eq!(orphaned[0].body, "removed diff comment");
+            assert_eq!(
+                orphaned[0].outdated_reason.as_deref(),
+                Some("file_not_in_diff")
+            );
         });
     }
 
