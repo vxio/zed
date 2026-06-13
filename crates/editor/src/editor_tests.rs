@@ -42645,6 +42645,60 @@ fn test_restore_preserves_collapsed_state(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_review_comment_agent_toolbox_label(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("line 1\nline 2\nline 3\n", cx));
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            let prompt_editor = editor.diff_review_prompt_editor().cloned().unwrap();
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.insert("needs a toolbox entry", window, cx);
+            });
+
+            let hunk_key = editor.diff_review_overlays[0].hunk_key.clone();
+            editor.toggle_prompt_agent_toolbox(&hunk_key, cx);
+            assert!(editor.diff_review_overlays[0].prompt_agent_toolbox);
+
+            editor.submit_diff_review_comment(window, cx);
+            assert!(
+                !editor.diff_review_overlays[0].prompt_agent_toolbox,
+                "submitting must reset the pending flag for the next comment"
+            );
+
+            let json = editor.review_comments_json(cx).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed["comments"][0]["agent_toolbox"], true);
+
+            editor
+                .restore_review_comments_json(&json, window, cx)
+                .unwrap();
+            let parsed: serde_json::Value =
+                serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
+            assert_eq!(
+                parsed["comments"][0]["agent_toolbox"], true,
+                "label must survive a restore round-trip"
+            );
+
+            let id = parsed["comments"][0]["id"].as_u64().unwrap() as usize;
+            editor.toggle_agent_toolbox_review_comment(id, cx);
+            let parsed: serde_json::Value =
+                serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
+            assert!(
+                parsed["comments"][0].get("agent_toolbox").is_none(),
+                "unlabeled comments must omit the field"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn test_diff_review_multiline_selection(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

@@ -538,6 +538,7 @@ impl EditorElement {
         );
         register_action(editor, window, Editor::toggle_review_comments_expanded);
         register_action(editor, window, Editor::toggle_all_review_comments);
+        register_action(editor, window, Editor::toggle_agent_toolbox);
         register_action(editor, window, Editor::submit_diff_review_comment_action);
         register_action(editor, window, Editor::send_review_to_agent);
         register_action(editor, window, Editor::edit_review_comment);

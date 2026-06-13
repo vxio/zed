@@ -246,6 +246,12 @@ some shell paths.
   so Amp and terminal workflows share one implementation. A first-class Zed
   command/server API would still be cleaner if this became a long-lived
   integration.
+- Comments can carry an `agent_toolbox` label (serialized as `"agent_toolbox": true`
+  in the comment JSON) marking them for agent-toolbox evolution pickup. Toggled via
+  the hammer icon on the compose row and saved comments, or the
+  `zed_review::ToggleAgentToolbox` action (pending-comment flag when a prompt is
+  focused, nearest comment otherwise). The `zed-review` CLI and Amp plugin pass the
+  field through.
 - Review `@` mentions are stored as markdown links for persistence/export, then
   rendered as clickable chips in saved comments and replies. File and symbol
   chips open the target in Zed; hovering shows the target URL/path in both the
