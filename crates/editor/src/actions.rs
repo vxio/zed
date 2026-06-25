@@ -1019,8 +1019,8 @@ actions!(
         ToggleResolvedThread,
         /// Expands all review comment threads, or collapses them all if every thread is already open.
         ToggleAllComments,
-        /// Toggles the agent-toolbox label on the comment being composed, or on the comment nearest the cursor.
-        ToggleAgentToolbox,
+        /// Toggles the agent-feedback label on the comment being composed, or on the comment nearest the cursor.
+        ToggleAgentFeedback,
     ]
 );
 

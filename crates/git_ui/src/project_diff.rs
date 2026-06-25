@@ -71,6 +71,8 @@ actions!(
         BranchDiff,
         /// Opens a new agent thread with the branch diff for review.
         ReviewDiff,
+        /// Refreshes the active diff view.
+        RefreshDiff,
         LeaderAndFollower,
         /// Compare with a specific branch
         CompareWithBranch,
@@ -119,6 +121,8 @@ pub struct ProjectDiff {
     last_review_comments_db_modified_on: Option<SystemTime>,
     restoring_review_comments: bool,
     review_comments_fully_restored: bool,
+    orphaned_review_comments_expanded: bool,
+    follows_default_branch: bool,
     _task: Task<Result<()>>,
     _review_comments_poll_task: Task<()>,
     _subscription: Subscription,
@@ -130,10 +134,6 @@ pub enum RefreshReason {
     StatusesChanged,
     EditorSaved,
 }
-
-const CONFLICT_SORT_PREFIX: u64 = 1;
-const TRACKED_SORT_PREFIX: u64 = 2;
-const NEW_SORT_PREFIX: u64 = 3;
 
 #[derive(Clone, Copy)]
 enum ReviewCommentArchiveScope {
@@ -185,6 +185,7 @@ impl ProjectDiff {
         workspace.register_action(Self::deploy);
         workspace.register_action(Self::deploy_branch_diff);
         workspace.register_action(Self::compare_with_branch);
+        workspace.register_action(Self::refresh_active_diff);
         workspace.register_action(|workspace, _: &ArchiveReviewComments, window, cx| {
             Self::archive_active_review_comments(
                 workspace,
@@ -252,6 +253,20 @@ impl ProjectDiff {
             Self::deploy(workspace, &Diff, window, cx);
         });
         workspace::register_serializable_item::<ProjectDiff>(cx);
+    }
+
+    fn refresh_active_diff(
+        workspace: &mut Workspace,
+        _: &RefreshDiff,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(project_diff) = workspace.active_item_as::<ProjectDiff>(cx) else {
+            return;
+        };
+        project_diff.update(cx, |project_diff, cx| {
+            project_diff.refresh_diff(window, cx);
+        });
     }
 
     fn archive_active_review_comments(
@@ -380,6 +395,7 @@ impl ProjectDiff {
                         project,
                         intended_repo,
                         base_ref,
+                        true,
                         window,
                         cx,
                     );
@@ -426,6 +442,7 @@ impl ProjectDiff {
                             project.clone(),
                             repository.clone(),
                             base_ref,
+                            false,
                             window,
                             cx,
                         );
@@ -451,6 +468,7 @@ impl ProjectDiff {
         project: Entity<Project>,
         intended_repo: Entity<Repository>,
         base_ref: SharedString,
+        follows_default_branch: bool,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
@@ -475,9 +493,15 @@ impl ProjectDiff {
 
             if needs_switch {
                 existing.update(cx, |project_diff, cx| {
+                    project_diff.follows_default_branch = follows_default_branch;
                     project_diff.branch_diff.update(cx, |branch_diff, cx| {
                         branch_diff.set_repo(Some(intended_repo), cx);
                     });
+                });
+            } else {
+                existing.update(cx, |project_diff, cx| {
+                    project_diff.follows_default_branch = follows_default_branch;
+                    cx.notify();
                 });
             }
 
@@ -495,6 +519,7 @@ impl ProjectDiff {
                             workspace.clone(),
                             base_ref,
                             intended_repo,
+                            follows_default_branch,
                             window,
                             cx,
                         )
@@ -929,6 +954,16 @@ impl ProjectDiff {
         }
 
         let mut loaded = true;
+        if let Some(comments_json) = comments_json.as_mut() {
+            let snapshot = self.multibuffer.read(cx).snapshot(cx);
+            let visible_paths = snapshot
+                .buffers_with_paths()
+                .map(|(_, path_key)| path_key.path.clone())
+                .collect::<Vec<_>>();
+            if let Some(remapped) = remap_review_comment_paths(comments_json, &visible_paths) {
+                *comments_json = remapped;
+            }
+        }
         self.restoring_review_comments = true;
         self.editor.update(cx, |editor, cx| {
             editor.rhs_editor().update(cx, |editor, cx| {
@@ -996,7 +1031,7 @@ impl ProjectDiff {
                 branch_diff
             })?;
             cx.new_window_entity(|window, cx| {
-                Self::new_impl(branch_diff, project, workspace, window, cx)
+                Self::new_impl(branch_diff, project, workspace, true, window, cx)
             })
         })
     }
@@ -1006,6 +1041,7 @@ impl ProjectDiff {
         workspace: Entity<Workspace>,
         base_ref: SharedString,
         repo: Entity<Repository>,
+        follows_default_branch: bool,
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<Entity<Self>>> {
@@ -1021,7 +1057,14 @@ impl ProjectDiff {
                 branch_diff
             })?;
             cx.new_window_entity(|window, cx| {
-                Self::new_impl(branch_diff, project, workspace, window, cx)
+                Self::new_impl(
+                    branch_diff,
+                    project,
+                    workspace,
+                    follows_default_branch,
+                    window,
+                    cx,
+                )
             })
         })
     }
@@ -1034,13 +1077,14 @@ impl ProjectDiff {
     ) -> Self {
         let branch_diff =
             cx.new(|cx| branch_diff::BranchDiff::new(DiffBase::Head, project.clone(), window, cx));
-        Self::new_impl(branch_diff, project, workspace, window, cx)
+        Self::new_impl(branch_diff, project, workspace, false, window, cx)
     }
 
     fn new_impl(
         branch_diff: Entity<branch_diff::BranchDiff>,
         project: Entity<Project>,
         workspace: Entity<Workspace>,
+        follows_default_branch: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1188,6 +1232,8 @@ impl ProjectDiff {
             last_review_comments_db_modified_on: None,
             restoring_review_comments: false,
             review_comments_fully_restored: true,
+            orphaned_review_comments_expanded: false,
+            follows_default_branch,
             _task: task,
             _review_comments_poll_task: review_comments_poll_task,
             _subscription: Subscription::join(
@@ -1276,6 +1322,61 @@ impl ProjectDiff {
     /// Returns the total count of review comments across all hunks/files.
     pub fn total_review_comment_count(&self) -> usize {
         self.review_comment_count
+    }
+
+    fn refresh_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_scroll.take();
+        self.review_comments_fully_restored = false;
+        if matches!(self.diff_base(cx), DiffBase::Merge { .. }) {
+            if self.follows_default_branch
+                && let Some(repo) = self.branch_diff.read(cx).repo().cloned()
+            {
+                let default_branch = repo.update(cx, |repo, _| repo.default_branch(true));
+                self._task = cx.spawn_in(window, async move |this, cx| {
+                    let default_branch = default_branch.await??;
+                    this.update(cx, |this, cx| {
+                        this.refresh_branch_diff(default_branch, cx);
+                    })?;
+                    Ok(())
+                });
+                cx.notify();
+                return;
+            }
+            self.refresh_branch_diff(None, cx);
+        } else {
+            self._task = cx.spawn_in(window, async move |this, cx| Self::refresh(this, cx).await);
+            cx.notify();
+        }
+    }
+
+    fn refresh_branch_diff(
+        &mut self,
+        default_branch: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(default_branch) = default_branch {
+            let diff_base = self.diff_base(cx).clone();
+            if !matches!(diff_base, DiffBase::Merge { ref base_ref } if base_ref == &default_branch)
+            {
+                self.branch_diff.update(cx, |branch_diff, cx| {
+                    branch_diff.set_diff_base(
+                        DiffBase::Merge {
+                            base_ref: default_branch,
+                        },
+                        cx,
+                    );
+                });
+                cx.notify();
+                return;
+            }
+        }
+
+        if matches!(self.diff_base(cx), DiffBase::Merge { .. }) {
+            self.branch_diff.update(cx, |branch_diff, cx| {
+                branch_diff.refresh(cx);
+            });
+        }
+        cx.notify();
     }
 
     /// Returns a reference to the splittable editor.
@@ -1787,6 +1888,97 @@ fn tree_sort_path(repo_path: &RelPath) -> Arc<RelPath> {
         .unwrap_or_else(|_| repo_path.into_arc())
 }
 
+fn remap_review_comment_paths(
+    comments_json: &str,
+    visible_paths: &[Arc<RelPath>],
+) -> Option<String> {
+    let mut snapshot = serde_json::from_str::<serde_json::Value>(comments_json).ok()?;
+    let comments = snapshot.get_mut("comments")?.as_array_mut()?;
+    let mut changed = false;
+
+    for comment in comments {
+        let Some(file) = comment.get("file").and_then(|file| file.as_str()) else {
+            continue;
+        };
+        if visible_paths.iter().any(|path| path.as_unix_str() == file) {
+            continue;
+        }
+        let Some(new_path) = review_comment_rename_candidate(file, visible_paths) else {
+            continue;
+        };
+        let Some(comment) = comment.as_object_mut() else {
+            continue;
+        };
+        comment.insert("file".to_string(), serde_json::Value::String(new_path));
+        let outdated_reason = comment
+            .get("outdated_reason")
+            .and_then(|reason| reason.as_str());
+        if outdated_reason.is_none() || outdated_reason == Some("file_not_in_diff") {
+            comment.insert("outdated".to_string(), serde_json::Value::Bool(false));
+            comment.remove("outdated_reason");
+        }
+        changed = true;
+    }
+
+    changed
+        .then(|| serde_json::to_string_pretty(&snapshot).ok())
+        .flatten()
+}
+
+fn review_comment_rename_candidate(file: &str, visible_paths: &[Arc<RelPath>]) -> Option<String> {
+    let old_path = std::path::Path::new(file);
+    let old_parent = old_path.parent();
+    let old_extension = old_path.extension();
+    let old_stem = old_path.file_stem()?.to_str()?;
+    let mut best = None;
+    let mut tied = false;
+
+    for candidate in visible_paths {
+        let candidate = candidate.as_unix_str();
+        if candidate == file {
+            continue;
+        }
+        let candidate_path = std::path::Path::new(candidate);
+        if candidate_path.parent() != old_parent || candidate_path.extension() != old_extension {
+            continue;
+        }
+        let Some(candidate_stem) = candidate_path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let score = shared_affix_len(old_stem, candidate_stem);
+        let max_len = old_stem.chars().count().max(candidate_stem.chars().count());
+        if score * 3 < max_len {
+            continue;
+        }
+        match best {
+            None => {
+                best = Some((candidate.to_string(), score));
+                tied = false;
+            }
+            Some((_, best_score)) if score > best_score => {
+                best = Some((candidate.to_string(), score));
+                tied = false;
+            }
+            Some((_, best_score)) if score == best_score => tied = true,
+            _ => {}
+        }
+    }
+
+    (!tied).then(|| best.map(|(path, _)| path)).flatten()
+}
+
+fn shared_affix_len(a: &str, b: &str) -> usize {
+    let prefix = a.chars().zip(b.chars()).take_while(|(a, b)| a == b).count();
+    let suffix = a
+        .chars()
+        .rev()
+        .zip(b.chars().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    (prefix + suffix).min(a.chars().count().min(b.chars().count()))
+}
+
 fn partition_review_comments_json(
     comments_json: &str,
     scope: ReviewCommentArchiveScope,
@@ -2232,6 +2424,8 @@ impl Render for ProjectDiff {
                         .when(!orphaned_review_comments.is_empty(), |el| {
                             el.child(Self::render_orphaned_review_comments(
                                 orphaned_review_comments.clone(),
+                                self.orphaned_review_comments_expanded,
+                                cx.weak_entity(),
                                 cx,
                             ))
                         })
@@ -2283,6 +2477,8 @@ impl Render for ProjectDiff {
                         .when(!orphaned_review_comments.is_empty(), |el| {
                             el.child(Self::render_orphaned_review_comments(
                                 orphaned_review_comments,
+                                self.orphaned_review_comments_expanded,
+                                cx.weak_entity(),
                                 cx,
                             ))
                         })
@@ -2295,6 +2491,8 @@ impl Render for ProjectDiff {
 impl ProjectDiff {
     fn render_orphaned_review_comments(
         comments: Vec<OrphanedReviewCommentSummary>,
+        expanded: bool,
+        this: WeakEntity<ProjectDiff>,
         cx: &App,
     ) -> AnyElement {
         let colors = cx.theme().colors();
@@ -2316,8 +2514,27 @@ impl ProjectDiff {
             .bg(colors.editor_background)
             .child(
                 h_flex()
+                    .id("orphaned-review-comments-header")
+                    .cursor_pointer()
                     .gap_2()
                     .items_center()
+                    .on_click(move |_, _window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.orphaned_review_comments_expanded =
+                                !this.orphaned_review_comments_expanded;
+                            cx.notify();
+                        })
+                        .log_err();
+                    })
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                    )
                     .child(
                         Icon::new(IconName::Warning)
                             .size(IconSize::Small)
@@ -2325,61 +2542,63 @@ impl ProjectDiff {
                     )
                     .child(Label::new(title).size(LabelSize::Small).color(Color::Muted)),
             )
-            .children(comments.into_iter().map(|comment| {
-                let line = if comment.line_start == comment.line_end {
-                    format!("{}:{}", comment.file, comment.line_start)
-                } else {
-                    format!(
-                        "{}:{}-{}",
-                        comment.file, comment.line_start, comment.line_end
-                    )
-                };
-                let reason = match comment.outdated_reason.as_deref() {
-                    Some("file_not_in_diff") => "file no longer has a visible diff",
-                    Some("line_not_in_diff") => "line no longer has a visible diff",
-                    _ => "change no longer has a visible diff",
-                };
-                let reply_label = match comment.reply_count {
-                    0 => None,
-                    1 => Some("1 reply".to_string()),
-                    count => Some(format!("{count} replies")),
-                };
+            .when(expanded, |el| {
+                el.children(comments.into_iter().map(|comment| {
+                    let line = if comment.line_start == comment.line_end {
+                        format!("{}:{}", comment.file, comment.line_start)
+                    } else {
+                        format!(
+                            "{}:{}-{}",
+                            comment.file, comment.line_start, comment.line_end
+                        )
+                    };
+                    let reason = match comment.outdated_reason.as_deref() {
+                        Some("file_not_in_diff") => "file no longer has a visible diff",
+                        Some("line_not_in_diff") => "line no longer has a visible diff",
+                        _ => "change no longer has a visible diff",
+                    };
+                    let reply_label = match comment.reply_count {
+                        0 => None,
+                        1 => Some("1 reply".to_string()),
+                        count => Some(format!("{count} replies")),
+                    };
 
-                v_flex()
-                    .w_full()
-                    .min_w_0()
-                    .gap_0p5()
-                    .px_2()
-                    .py_1p5()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(colors.border_variant)
-                    .bg(colors.element_background)
-                    .child(
-                        h_flex()
-                            .gap_1p5()
-                            .items_center()
-                            .child(Label::new(line).size(LabelSize::Small).color(Color::Muted))
-                            .child(
-                                Label::new("Outdated")
-                                    .size(LabelSize::Small)
-                                    .color(Color::Warning),
-                            )
-                            .child(
-                                Label::new(reason)
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .when_some(reply_label, |el, reply_label| {
-                                el.child(
-                                    Label::new(reply_label)
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_0p5()
+                        .px_2()
+                        .py_1p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border_variant)
+                        .bg(colors.element_background)
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .items_center()
+                                .child(Label::new(line).size(LabelSize::Small).color(Color::Muted))
+                                .child(
+                                    Label::new("Outdated")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Warning),
+                                )
+                                .child(
+                                    Label::new(reason)
                                         .size(LabelSize::Small)
                                         .color(Color::Muted),
                                 )
-                            }),
-                    )
-                    .child(Label::new(comment.body).size(LabelSize::Small))
-            }))
+                                .when_some(reply_label, |el, reply_label| {
+                                    el.child(
+                                        Label::new(reply_label)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                }),
+                        )
+                        .child(Label::new(comment.body).size(LabelSize::Small))
+                }))
+            })
             .into_any_element()
     }
 }
@@ -2414,9 +2633,9 @@ impl SerializableItem for ProjectDiff {
                 let branch_diff = cx
                     .new(|cx| branch_diff::BranchDiff::new(diff_base, project.clone(), window, cx));
                 let workspace = workspace.upgrade().context("workspace gone")?;
-                anyhow::Ok(
-                    cx.new(|cx| ProjectDiff::new_impl(branch_diff, project, workspace, window, cx)),
-                )
+                anyhow::Ok(cx.new(|cx| {
+                    ProjectDiff::new_impl(branch_diff, project, workspace, false, window, cx)
+                }))
             })??;
 
             Ok(diff)
@@ -3130,6 +3349,18 @@ impl Render for BranchDiffToolbar {
             .justify_end()
             .gap_2()
             .child(
+                IconButton::new("refresh-diff", IconName::RotateCw)
+                    .shape(ui::IconButtonShape::Square)
+                    .tooltip(Tooltip::for_action_title_in(
+                        "Refresh Diff",
+                        &RefreshDiff,
+                        &focus_handle,
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.dispatch_action(&RefreshDiff, window, cx);
+                    })),
+            )
+            .child(
                 PopoverMenu::new("branch-diff-base-branch-picker")
                     .menu(move |window, cx| {
                         let project_diff = project_diff_for_picker.clone();
@@ -3140,6 +3371,7 @@ impl Render for BranchDiffToolbar {
                                 let base_ref: SharedString = branch.name().to_owned().into();
                                 project_diff
                                     .update(cx, |project_diff, cx| {
+                                        project_diff.follows_default_branch = false;
                                         let branch_diff = &mut project_diff.branch_diff;
                                         branch_diff.update(cx, |branch_diff, cx| {
                                             branch_diff
@@ -3295,6 +3527,37 @@ mod tests {
         assert_eq!(archived_count, 1);
         assert_eq!(archived["comments"][0]["body"], "user");
         assert_eq!(remaining["comments"][0]["body"], "agent");
+    }
+
+    #[test]
+    fn test_remap_review_comment_paths_follows_renames() {
+        let comments_json = serde_json::json!({
+            "schema_version": 1,
+            "comments": [
+                { "id": 0, "author": "vxio", "file": "pkg/name_latest.go", "side": "new", "hunk_line": 2, "line_start": 1, "line_end": 1, "body": "follow", "outdated": true, "outdated_reason": "file_not_in_diff", "replies": [] },
+                { "id": 1, "author": "vxio", "file": "other.go", "side": "new", "hunk_line": 2, "line_start": 1, "line_end": 1, "body": "stay", "outdated": true, "outdated_reason": "file_not_in_diff", "replies": [] }
+            ]
+        })
+        .to_string();
+
+        let remapped = remap_review_comment_paths(
+            &comments_json,
+            &[
+                RelPath::unix("pkg/name_dev.go").unwrap().into_arc(),
+                RelPath::unix("other.go").unwrap().into_arc(),
+            ],
+        )
+        .unwrap();
+        let remapped: serde_json::Value = serde_json::from_str(&remapped).unwrap();
+
+        assert_eq!(remapped["comments"][0]["file"], "pkg/name_dev.go");
+        assert_eq!(remapped["comments"][0]["outdated"], false);
+        assert!(remapped["comments"][0].get("outdated_reason").is_none());
+        assert_eq!(remapped["comments"][1]["file"], "other.go");
+        assert_eq!(
+            remapped["comments"][1]["outdated_reason"],
+            "file_not_in_diff"
+        );
     }
 
     #[gpui::test]
@@ -5343,6 +5606,7 @@ mod tests {
                     workspace.clone(),
                     "topic".into(),
                     repository,
+                    false,
                     window,
                     cx,
                 )
@@ -5385,6 +5649,51 @@ mod tests {
 
         assert_eq!(active_base_ref, "origin/main");
         assert_eq!(base_refs, vec!["origin/main", "topic"]);
+    }
+
+    #[gpui::test]
+    async fn test_refresh_default_branch_diff_updates_base_ref(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "changed",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx
+            .update(|window, cx| {
+                let Some(repository) = project.read(cx).active_repository(cx) else {
+                    return Task::ready(Err(anyhow!("No active repository")));
+                };
+                ProjectDiff::new_with_branch_base(
+                    project.clone(),
+                    workspace,
+                    "origin/main".into(),
+                    repository,
+                    true,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        diff.update(cx, |diff, cx| {
+            diff.refresh_branch_diff(Some("origin/dev".into()), cx);
+        });
+
+        diff.read_with(cx, |diff, cx| match diff.diff_base(cx) {
+            DiffBase::Merge { base_ref } => assert_eq!(base_ref.as_ref(), "origin/dev"),
+            DiffBase::Head => panic!("expected branch diff"),
+        });
     }
 
     #[gpui::test]

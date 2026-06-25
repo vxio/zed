@@ -42645,7 +42645,7 @@ fn test_restore_preserves_collapsed_state(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn test_review_comment_agent_toolbox_label(cx: &mut TestAppContext) {
+fn test_review_comment_agent_feedback_label(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
     let editor = cx.add_window(|window, cx| {
@@ -42659,22 +42659,22 @@ fn test_review_comment_agent_toolbox_label(cx: &mut TestAppContext) {
             editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
             let prompt_editor = editor.diff_review_prompt_editor().cloned().unwrap();
             prompt_editor.update(cx, |prompt_editor, cx| {
-                prompt_editor.insert("needs a toolbox entry", window, cx);
+                prompt_editor.insert("needs a feedback entry", window, cx);
             });
 
             let hunk_key = editor.diff_review_overlays[0].hunk_key.clone();
-            editor.toggle_prompt_agent_toolbox(&hunk_key, cx);
-            assert!(editor.diff_review_overlays[0].prompt_agent_toolbox);
+            editor.toggle_prompt_agent_feedback(&hunk_key, cx);
+            assert!(editor.diff_review_overlays[0].prompt_agent_feedback);
 
             editor.submit_diff_review_comment(window, cx);
             assert!(
-                !editor.diff_review_overlays[0].prompt_agent_toolbox,
+                !editor.diff_review_overlays[0].prompt_agent_feedback,
                 "submitting must reset the pending flag for the next comment"
             );
 
             let json = editor.review_comments_json(cx).unwrap();
             let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-            assert_eq!(parsed["comments"][0]["agent_toolbox"], true);
+            assert_eq!(parsed["comments"][0]["agent_feedback"], true);
 
             editor
                 .restore_review_comments_json(&json, window, cx)
@@ -42682,17 +42682,62 @@ fn test_review_comment_agent_toolbox_label(cx: &mut TestAppContext) {
             let parsed: serde_json::Value =
                 serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
             assert_eq!(
-                parsed["comments"][0]["agent_toolbox"], true,
+                parsed["comments"][0]["agent_feedback"], true,
                 "label must survive a restore round-trip"
             );
 
+            let legacy_json = json.replace("agent_feedback", "agent_toolbox");
+            editor
+                .restore_review_comments_json(&legacy_json, window, cx)
+                .unwrap();
+            let parsed: serde_json::Value =
+                serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
+            assert_eq!(
+                parsed["comments"][0]["agent_feedback"], true,
+                "legacy labels must restore under the renamed field"
+            );
+            assert!(parsed["comments"][0].get("agent_toolbox").is_none());
+
             let id = parsed["comments"][0]["id"].as_u64().unwrap() as usize;
-            editor.toggle_agent_toolbox_review_comment(id, cx);
+            editor.toggle_agent_feedback_review_comment(id, cx);
             let parsed: serde_json::Value =
                 serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
             assert!(
-                parsed["comments"][0].get("agent_toolbox").is_none(),
+                parsed["comments"][0].get("agent_feedback").is_none(),
                 "unlabeled comments must omit the field"
+            );
+
+            editor.add_review_reply(id, "reply needs a feedback entry".to_string(), cx);
+            let parsed: serde_json::Value =
+                serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
+            let reply_id = parsed["comments"][0]["replies"][0]["id"].as_u64().unwrap() as usize;
+
+            editor.toggle_agent_feedback_review_reply(reply_id, cx);
+            let json = editor.review_comments_json(cx).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                parsed["comments"][0]["replies"][0]["agent_feedback"], true,
+                "reply label must serialize"
+            );
+
+            editor
+                .restore_review_comments_json(&json, window, cx)
+                .unwrap();
+            let parsed: serde_json::Value =
+                serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
+            assert_eq!(
+                parsed["comments"][0]["replies"][0]["agent_feedback"], true,
+                "reply label must survive a restore round-trip"
+            );
+
+            editor.toggle_agent_feedback_review_reply(reply_id, cx);
+            let parsed: serde_json::Value =
+                serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
+            assert!(
+                parsed["comments"][0]["replies"][0]
+                    .get("agent_feedback")
+                    .is_none(),
+                "unlabeled replies must omit the field"
             );
         })
         .unwrap();

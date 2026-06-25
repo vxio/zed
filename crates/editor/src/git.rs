@@ -348,7 +348,7 @@ pub(super) struct StoredReviewComment {
     pub(super) outdated: bool,
     pub(super) outdated_reason: Option<String>,
     pub(super) review_round: Option<u32>,
-    pub(super) agent_toolbox: bool,
+    pub(super) agent_feedback: bool,
     /// Runtime-only: expands a resolved thread in place without unresolving it.
     pub(super) show_resolved: bool,
     location: ReviewCommentLocation,
@@ -362,6 +362,7 @@ pub(super) struct StoredReviewReply {
     pub(super) comment: String,
     pub(super) is_editing: bool,
     pub(super) review_round: Option<u32>,
+    pub(super) agent_feedback: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -498,8 +499,8 @@ pub(super) struct ReviewCommentSnapshot {
     outdated_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     review_round: Option<u32>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    agent_toolbox: bool,
+    #[serde(default, alias = "agent_toolbox", skip_serializing_if = "is_false")]
+    agent_feedback: bool,
     #[serde(default)]
     replies: Vec<ReviewReplySnapshot>,
 }
@@ -514,6 +515,8 @@ struct ReviewReplySnapshot {
     body: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     review_round: Option<u32>,
+    #[serde(default, alias = "agent_toolbox", skip_serializing_if = "is_false")]
+    agent_feedback: bool,
 }
 
 fn default_review_comment_author() -> String {
@@ -1456,7 +1459,7 @@ pub(super) struct DiffReviewOverlay {
     pub(super) hunk_key: DiffHunkKey,
     pub(super) comments_expanded: bool,
     pub(super) prompt_visible: bool,
-    pub(super) prompt_agent_toolbox: bool,
+    pub(super) prompt_agent_feedback: bool,
     pub(super) confirming_discard: bool,
     pub(super) inline_edit_editors: HashMap<usize, Entity<Editor>>,
     pub(super) inline_edit_subscriptions: HashMap<usize, Subscription>,
@@ -1520,7 +1523,7 @@ impl StoredReviewComment {
             outdated: false,
             outdated_reason: None,
             review_round: None,
-            agent_toolbox: false,
+            agent_feedback: false,
             show_resolved: false,
             location,
         }
@@ -2274,7 +2277,7 @@ impl Editor {
             hunk_key: hunk_key.clone(),
             comments_expanded,
             prompt_visible,
-            prompt_agent_toolbox: false,
+            prompt_agent_feedback: false,
             confirming_discard: false,
             inline_edit_editors: HashMap::default(),
             inline_edit_subscriptions: HashMap::default(),
@@ -2340,12 +2343,12 @@ impl Editor {
             .anchor_range
             .clone();
         let hunk_key = self.diff_review_overlays[overlay_index].hunk_key.clone();
-        let agent_toolbox = self.diff_review_overlays[overlay_index].prompt_agent_toolbox;
+        let agent_feedback = self.diff_review_overlays[overlay_index].prompt_agent_feedback;
 
         let id = self.add_review_comment(hunk_key.clone(), comment_text, anchor_range, cx);
-        if agent_toolbox {
+        if agent_feedback {
             if let Some(comment) = self.stored_review_comment_mut(id) {
-                comment.agent_toolbox = true;
+                comment.agent_feedback = true;
             }
         }
 
@@ -2356,7 +2359,7 @@ impl Editor {
         }
         if let Some(overlay) = self.diff_review_overlays.get_mut(overlay_index) {
             overlay.prompt_visible = false;
-            overlay.prompt_agent_toolbox = false;
+            overlay.prompt_agent_feedback = false;
         }
 
         self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
@@ -3043,7 +3046,7 @@ impl Editor {
         cx.notify();
     }
 
-    pub(super) fn toggle_prompt_agent_toolbox(
+    pub(super) fn toggle_prompt_agent_feedback(
         &mut self,
         hunk_key: &DiffHunkKey,
         cx: &mut Context<Self>,
@@ -3054,7 +3057,7 @@ impl Editor {
             .iter_mut()
             .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, &snapshot))
         {
-            overlay.prompt_agent_toolbox = !overlay.prompt_agent_toolbox;
+            overlay.prompt_agent_feedback = !overlay.prompt_agent_feedback;
             cx.notify();
         }
     }
@@ -3321,6 +3324,7 @@ impl Editor {
                 created_at: current_review_comment_timestamp(),
                 body: reply,
                 review_round: None,
+                agent_feedback: false,
             });
             cx.emit(EditorEvent::ReviewCommentsChanged {
                 total_count: self.total_review_comment_count(),
@@ -3339,6 +3343,7 @@ impl Editor {
                     comment: reply,
                     is_editing: false,
                     review_round: None,
+                    agent_feedback: false,
                 });
                 cx.emit(EditorEvent::ReviewCommentsChanged {
                     total_count: self.total_review_comment_count(),
@@ -3581,7 +3586,15 @@ impl Editor {
             .find(|comment| comment.id == id)
     }
 
-    pub(super) fn toggle_agent_toolbox_review_comment(
+    fn stored_review_reply_mut(&mut self, id: usize) -> Option<&mut StoredReviewReply> {
+        self.stored_review_comments
+            .iter_mut()
+            .flat_map(|(_, comments)| comments.iter_mut())
+            .flat_map(|comment| comment.replies.iter_mut())
+            .find(|reply| reply.id == id)
+    }
+
+    pub(super) fn toggle_agent_feedback_review_comment(
         &mut self,
         id: usize,
         cx: &mut Context<Self>,
@@ -3589,7 +3602,7 @@ impl Editor {
         let Some(comment) = self.stored_review_comment_mut(id) else {
             return;
         };
-        comment.agent_toolbox = !comment.agent_toolbox;
+        comment.agent_feedback = !comment.agent_feedback;
         cx.emit(EditorEvent::ReviewCommentsChanged {
             total_count: self.total_review_comment_count(),
             persist: true,
@@ -3597,21 +3610,33 @@ impl Editor {
         cx.notify();
     }
 
-    pub(super) fn toggle_agent_toolbox(
+    pub(super) fn toggle_agent_feedback_review_reply(&mut self, id: usize, cx: &mut Context<Self>) {
+        let Some(reply) = self.stored_review_reply_mut(id) else {
+            return;
+        };
+        reply.agent_feedback = !reply.agent_feedback;
+        cx.emit(EditorEvent::ReviewCommentsChanged {
+            total_count: self.total_review_comment_count(),
+            persist: true,
+        });
+        cx.notify();
+    }
+
+    pub(super) fn toggle_agent_feedback(
         &mut self,
-        _: &ToggleAgentToolbox,
+        _: &ToggleAgentFeedback,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(overlay) = self.diff_review_overlays.iter_mut().find(|overlay| {
             overlay.prompt_visible && overlay.prompt_editor.focus_handle(cx).is_focused(window)
         }) {
-            overlay.prompt_agent_toolbox = !overlay.prompt_agent_toolbox;
+            overlay.prompt_agent_feedback = !overlay.prompt_agent_feedback;
             cx.notify();
             return;
         }
         if let Some(id) = self.current_review_comment_id(cx) {
-            self.toggle_agent_toolbox_review_comment(id, cx);
+            self.toggle_agent_feedback_review_comment(id, cx);
             return;
         }
         // Dispatched from a nested review-comment input editor, which has no
@@ -3754,7 +3779,7 @@ impl Editor {
             outdated: comment.outdated,
             outdated_reason: comment.outdated_reason.clone(),
             review_round: comment.review_round,
-            agent_toolbox: comment.agent_toolbox,
+            agent_feedback: comment.agent_feedback,
             replies: comment
                 .replies
                 .iter()
@@ -3764,6 +3789,7 @@ impl Editor {
                     created_at: reply.created_at.clone(),
                     body: reply.comment.clone(),
                     review_round: reply.review_round,
+                    agent_feedback: reply.agent_feedback,
                 })
                 .collect(),
         }
@@ -3884,6 +3910,7 @@ impl Editor {
                     comment: reply.body,
                     is_editing: false,
                     review_round: reply.review_round,
+                    agent_feedback: reply.agent_feedback,
                 })
                 .collect();
             let comment = StoredReviewComment::new_with_author(
@@ -3901,7 +3928,7 @@ impl Editor {
                 outdated: saved_comment.outdated,
                 outdated_reason: saved_comment.outdated_reason,
                 review_round: saved_comment.review_round,
-                agent_toolbox: saved_comment.agent_toolbox,
+                agent_feedback: saved_comment.agent_feedback,
                 ..comment
             };
 
@@ -5733,7 +5760,7 @@ impl Editor {
             comments,
             comments_expanded,
             prompt_visible,
-            prompt_agent_toolbox,
+            prompt_agent_feedback,
             inline_editors,
             inline_reply_editors,
             reply_editors,
@@ -5750,7 +5777,7 @@ impl Editor {
                 let (
                     expanded,
                     prompt_visible,
-                    prompt_agent_toolbox,
+                    prompt_agent_feedback,
                     editors,
                     inline_reply_editors,
                     reply_editors,
@@ -5777,7 +5804,7 @@ impl Editor {
                         (
                             o.comments_expanded,
                             o.prompt_visible,
-                            o.prompt_agent_toolbox,
+                            o.prompt_agent_feedback,
                             o.inline_edit_editors.clone(),
                             o.inline_reply_edit_editors.clone(),
                             o.reply_editors.clone(),
@@ -5807,7 +5834,7 @@ impl Editor {
                     comments,
                     expanded,
                     prompt_visible,
-                    prompt_agent_toolbox,
+                    prompt_agent_feedback,
                     editors,
                     inline_reply_editors,
                     reply_editors,
@@ -5937,21 +5964,21 @@ impl Editor {
                                 )
                                 .child(
                                     IconButton::new(
-                                        "diff-review-prompt-agent-toolbox",
+                                        "diff-review-prompt-agent-feedback",
                                         IconName::ToolHammer,
                                     )
-                                    .icon_color(if prompt_agent_toolbox {
+                                    .icon_color(if prompt_agent_feedback {
                                         ui::Color::Accent
                                     } else {
                                         ui::Color::Muted
                                     })
                                     .icon_size(action_icon_size)
                                     .size(ButtonSize::Medium)
-                                    .toggle_state(prompt_agent_toolbox)
-                                    .tooltip(Tooltip::text(if prompt_agent_toolbox {
-                                        "Unmark for agent-toolbox"
+                                    .toggle_state(prompt_agent_feedback)
+                                    .tooltip(Tooltip::text(if prompt_agent_feedback {
+                                        "Unmark for agent-feedback"
                                     } else {
-                                        "Mark for agent-toolbox"
+                                        "Mark for agent-feedback"
                                     }))
                                     .on_click({
                                         let editor_handle = editor_handle.clone();
@@ -5959,8 +5986,9 @@ impl Editor {
                                         move |_, _window, cx| {
                                             if let Some(editor) = editor_handle.upgrade() {
                                                 editor.update(cx, |editor, cx| {
-                                                    editor
-                                                        .toggle_prompt_agent_toolbox(&hunk_key, cx);
+                                                    editor.toggle_prompt_agent_feedback(
+                                                        &hunk_key, cx,
+                                                    );
                                                 });
                                             }
                                         }
@@ -6128,8 +6156,9 @@ impl Editor {
         let is_resolved = comment.resolved_on.is_some();
         let show_resolved = comment.show_resolved;
         let reply_count = comment.replies.len();
-        let agent_toolbox = comment.agent_toolbox;
-        let agent_toolbox_editor_handle = editor_handle.clone();
+        let agent_feedback = comment.agent_feedback;
+        let agent_feedback_editor_handle = editor_handle.clone();
+        let edit_agent_feedback_editor_handle = editor_handle.clone();
         let cancel_editor_handle = editor_handle.clone();
         let confirm_editor_handle = editor_handle.clone();
         let edit_editor_handle = editor_handle.clone();
@@ -6349,26 +6378,26 @@ impl Editor {
                             )
                             .child(
                                 IconButton::new(
-                                    format!("diff-review-agent-toolbox-{comment_id}"),
+                                    format!("diff-review-agent-feedback-{comment_id}"),
                                     IconName::ToolHammer,
                                 )
-                                .icon_color(if agent_toolbox {
+                                .icon_color(if agent_feedback {
                                     ui::Color::Accent
                                 } else {
                                     ui::Color::Muted
                                 })
                                 .icon_size(action_icon_size)
                                 .size(ButtonSize::None)
-                                .toggle_state(agent_toolbox)
-                                .tooltip(Tooltip::text(if agent_toolbox {
-                                    "Unmark for agent-toolbox"
+                                .toggle_state(agent_feedback)
+                                .tooltip(Tooltip::text(if agent_feedback {
+                                    "Unmark for agent-feedback"
                                 } else {
-                                    "Mark for agent-toolbox"
+                                    "Mark for agent-feedback"
                                 }))
                                 .on_click(move |_, _window, cx| {
-                                    if let Some(editor) = agent_toolbox_editor_handle.upgrade() {
+                                    if let Some(editor) = agent_feedback_editor_handle.upgrade() {
                                         editor.update(cx, |editor, cx| {
-                                            editor.toggle_agent_toolbox_review_comment(
+                                            editor.toggle_agent_feedback_review_comment(
                                                 comment_id, cx,
                                             );
                                         });
@@ -6557,6 +6586,38 @@ impl Editor {
                                 .gap_1()
                                 .child(
                                     IconButton::new(
+                                        format!("diff-review-edit-agent-feedback-{comment_id}"),
+                                        IconName::ToolHammer,
+                                    )
+                                    .icon_color(if agent_feedback {
+                                        ui::Color::Accent
+                                    } else {
+                                        ui::Color::Muted
+                                    })
+                                    .icon_size(action_icon_size)
+                                    .size(ButtonSize::Medium)
+                                    .toggle_state(agent_feedback)
+                                    .tooltip(Tooltip::text(if agent_feedback {
+                                        "Unmark for agent-feedback"
+                                    } else {
+                                        "Mark for agent-feedback"
+                                    }))
+                                    .on_click(
+                                        move |_, _window, cx| {
+                                            if let Some(editor) =
+                                                edit_agent_feedback_editor_handle.upgrade()
+                                            {
+                                                editor.update(cx, |editor, cx| {
+                                                    editor.toggle_agent_feedback_review_comment(
+                                                        comment_id, cx,
+                                                    );
+                                                });
+                                            }
+                                        },
+                                    ),
+                                )
+                                .child(
+                                    IconButton::new(
                                         format!("diff-review-cancel-edit-{comment_id}"),
                                         IconName::Close,
                                     )
@@ -6604,10 +6665,13 @@ impl Editor {
                 let reply_id = reply.id;
                 let reply_review_round = reply.review_round;
                 let reply_created_at = reply.created_at.clone();
+                let reply_agent_feedback = reply.agent_feedback;
                 let inline_reply_editor = inline_reply_editors.get(&reply_id).cloned();
                 let is_editing_reply = inline_reply_editor.is_some();
                 let reply_to_thread_handle = reply_row_editor_handle.clone();
                 let copy_reply_handle = reply_row_editor_handle.clone();
+                let agent_feedback_reply_handle = reply_row_editor_handle.clone();
+                let edit_agent_feedback_reply_handle = reply_row_editor_handle.clone();
                 let edit_reply_handle = reply_row_editor_handle.clone();
                 let delete_reply_handle = reply_row_editor_handle.clone();
                 let cancel_reply_edit_handle = reply_row_editor_handle.clone();
@@ -6668,6 +6732,32 @@ impl Editor {
                                         editor.update(cx, |editor, cx| {
                                             editor
                                                 .copy_review_comment_reference(reply_id, true, cx);
+                                        });
+                                    }
+                                }),
+                            )
+                            .child(
+                                IconButton::new(
+                                    format!("diff-review-agent-feedback-reply-{reply_id}"),
+                                    IconName::ToolHammer,
+                                )
+                                .icon_color(if reply_agent_feedback {
+                                    ui::Color::Accent
+                                } else {
+                                    ui::Color::Muted
+                                })
+                                .icon_size(action_icon_size)
+                                .size(ButtonSize::None)
+                                .toggle_state(reply_agent_feedback)
+                                .tooltip(Tooltip::text(if reply_agent_feedback {
+                                    "Unmark reply for agent-feedback"
+                                } else {
+                                    "Mark reply for agent-feedback"
+                                }))
+                                .on_click(move |_, _window, cx| {
+                                    if let Some(editor) = agent_feedback_reply_handle.upgrade() {
+                                        editor.update(cx, |editor, cx| {
+                                            editor.toggle_agent_feedback_review_reply(reply_id, cx);
                                         });
                                     }
                                 }),
@@ -6765,6 +6855,38 @@ impl Editor {
                             h_flex()
                                 .flex_shrink_0()
                                 .gap_1()
+                                .child(
+                                    IconButton::new(
+                                        format!("diff-review-edit-agent-feedback-reply-{reply_id}"),
+                                        IconName::ToolHammer,
+                                    )
+                                    .icon_color(if reply_agent_feedback {
+                                        ui::Color::Accent
+                                    } else {
+                                        ui::Color::Muted
+                                    })
+                                    .icon_size(action_icon_size)
+                                    .size(ButtonSize::Medium)
+                                    .toggle_state(reply_agent_feedback)
+                                    .tooltip(Tooltip::text(if reply_agent_feedback {
+                                        "Unmark reply for agent-feedback"
+                                    } else {
+                                        "Mark reply for agent-feedback"
+                                    }))
+                                    .on_click(
+                                        move |_, _window, cx| {
+                                            if let Some(editor) =
+                                                edit_agent_feedback_reply_handle.upgrade()
+                                            {
+                                                editor.update(cx, |editor, cx| {
+                                                    editor.toggle_agent_feedback_review_reply(
+                                                        reply_id, cx,
+                                                    );
+                                                });
+                                            }
+                                        },
+                                    ),
+                                )
                                 .child(
                                     IconButton::new(
                                         format!("diff-review-cancel-reply-edit-{reply_id}"),

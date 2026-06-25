@@ -5,6 +5,7 @@ source script/lib/blob-store.sh
 
 build_flag="--release"
 target_dir="release"
+cargo_target_dir="${CARGO_TARGET_DIR:-target}"
 open_result=false
 local_install=false
 can_code_sign=false
@@ -244,7 +245,7 @@ function sign_app_binaries() {
             echo "$app_path"
         fi
     else
-        dmg_target_directory="target/${target_triple}/${target_dir}"
+        dmg_target_directory="${cargo_target_dir}/${target_triple}/${target_dir}"
         dmg_source_directory="${dmg_target_directory}/dmg"
         dmg_file_path="${dmg_target_directory}/Zed-${arch_suffix}.dmg"
         xcode_bin_dir_path="$(xcode-select -p)/usr/bin"
@@ -298,15 +299,15 @@ function upload_debug_symbols() {
         echo "local install; skipping sentry upload."
     elif [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
         echo "Uploading zed debug symbols to sentry..."
-        exe_path="target/${target_triple}/release/Zed"
-        if ! dsymutil --flat "target/${target_triple}/${target_dir}/zed" 2> target/dsymutil.log; then
+        exe_path="${cargo_target_dir}/${target_triple}/release/Zed"
+        if ! dsymutil --flat "${cargo_target_dir}/${target_triple}/${target_dir}/zed" 2> "${cargo_target_dir}/dsymutil.log"; then
             echo "dsymutil failed"
-            cat target/dsymutil.log
+            cat "${cargo_target_dir}/dsymutil.log"
             exit 1
         fi
-        if ! dsymutil --flat "target/${target_triple}/${target_dir}/remote_server" 2> target/dsymutil.log; then
+        if ! dsymutil --flat "${cargo_target_dir}/${target_triple}/${target_dir}/remote_server" 2> "${cargo_target_dir}/dsymutil.log"; then
             echo "dsymutil failed"
-            cat target/dsymutil.log
+            cat "${cargo_target_dir}/dsymutil.log"
             exit 1
         fi
         # note: this uploads the unstripped binary which is needed because it contains
@@ -315,8 +316,8 @@ function upload_debug_symbols() {
         for attempt in 1 2 3; do
             echo "Sentry upload attempt $attempt..."
             if sentry-cli debug-files upload --include-sources --wait -p zed -o zed-dev \
-                "target/${target_triple}/${target_dir}/zed.dwarf" \
-                "target/${target_triple}/${target_dir}/remote_server.dwarf"; then
+                "${cargo_target_dir}/${target_triple}/${target_dir}/zed.dwarf" \
+                "${cargo_target_dir}/${target_triple}/${target_dir}/remote_server.dwarf"; then
                 break
             else
                 echo "Sentry upload failed on attempt $attempt"
@@ -333,9 +334,9 @@ function upload_debug_symbols() {
 
 upload_debug_symbols
 
-cp target/${target_triple}/${target_dir}/zed "${app_path}/Contents/MacOS/zed"
-cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
+cp "${cargo_target_dir}/${target_triple}/${target_dir}/zed" "${app_path}/Contents/MacOS/zed"
+cp "${cargo_target_dir}/${target_triple}/${target_dir}/cli" "${app_path}/Contents/MacOS/cli"
 sign_app_binaries
 
-sign_binary "target/$target_triple/release/remote_server"
-gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+sign_binary "${cargo_target_dir}/${target_triple}/release/remote_server"
+gzip -f --stdout --best "${cargo_target_dir}/${target_triple}/release/remote_server" > "${cargo_target_dir}/zed-remote-server-macos-$arch_suffix.gz"
