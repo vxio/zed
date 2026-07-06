@@ -22,8 +22,9 @@ use git::{
     status::FileStatus,
 };
 use gpui::{
-    Action, App, AppContext as _, AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable,
-    PromptLevel, Render, Subscription, Task, WeakEntity, actions,
+    Action, AnyElement, App, AppContext as _, AsyncWindowContext, ClipboardItem, Entity,
+    EventEmitter, FocusHandle, Focusable, PromptLevel, Render, Subscription, Task, WeakEntity,
+    actions,
 };
 use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt};
 use multi_buffer::{MultiBuffer, PathKey};
@@ -39,6 +40,7 @@ use settings::{
 };
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use theme::ActiveTheme;
@@ -103,6 +105,8 @@ actions!(
         RestoreLatestUserReviewComments,
         /// Restores the newest archived agent-authored review comment session.
         RestoreLatestAgentReviewComments,
+        /// Copies an Amp prompt for addressing unstamped review comments.
+        CopyAmpPromptForUnstampedReviewComments,
     ]
 );
 
@@ -152,6 +156,10 @@ enum RestoreLatestReviewCommentsResult {
 
 fn restore_latest_review_comments_notification_id() -> NotificationId {
     NotificationId::named("zed-review-restore-latest".into())
+}
+
+fn copy_amp_prompt_notification_id() -> NotificationId {
+    NotificationId::named("zed-review-copy-amp-prompt".into())
 }
 
 impl ReviewCommentArchiveScope {
@@ -249,6 +257,11 @@ impl ProjectDiff {
                 );
             },
         );
+        workspace.register_action(
+            |workspace, _: &CopyAmpPromptForUnstampedReviewComments, window, cx| {
+                Self::copy_active_amp_prompt_for_unstamped_review_comments(workspace, window, cx);
+            },
+        );
         workspace.register_action(|workspace, _: &Add, window, cx| {
             Self::deploy(workspace, &Diff, window, cx);
         });
@@ -315,6 +328,22 @@ impl ProjectDiff {
             RestoreLatestReviewCommentsResult::Failed
             | RestoreLatestReviewCommentsResult::Restored => {}
         }
+    }
+
+    fn copy_active_amp_prompt_for_unstamped_review_comments(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(workspace_id) = workspace.database_id() else {
+            return;
+        };
+        let Some(project_diff) = workspace.active_item_as::<ProjectDiff>(cx) else {
+            return;
+        };
+        project_diff.update(cx, |project_diff, cx| {
+            project_diff.copy_amp_prompt_for_unstamped_review_comments(workspace_id, window, cx);
+        });
     }
 
     fn delete_active_review_comments(
@@ -752,6 +781,63 @@ impl ProjectDiff {
         let db = persistence::ProjectDiffDb::global(cx);
         let save = db.save_review_comments(workspace_id, review_key, comments_json);
         cx.background_spawn(save).detach_and_log_err(cx);
+    }
+
+    fn copy_amp_prompt_for_unstamped_review_comments(
+        &mut self,
+        workspace_id: workspace::WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(review_key) = self.review_comments_key(cx) else {
+            return;
+        };
+        let Some(repo) = review_key
+            .lines()
+            .next()
+            .filter(|repo| !repo.is_empty())
+            .map(ToOwned::to_owned)
+        else {
+            return;
+        };
+        let Ok(comments_json) = self
+            .editor
+            .read(cx)
+            .rhs_editor()
+            .read(cx)
+            .review_comments_json(cx)
+        else {
+            return;
+        };
+
+        let db = persistence::ProjectDiffDb::global(cx);
+        let workspace = self.workspace.clone();
+        let error_workspace = self.workspace.clone();
+        window
+            .spawn(cx, async move |cx| {
+                db.save_review_comments(workspace_id, review_key.clone(), comments_json)
+                    .await
+                    .context("saving review comments before generating Amp prompt")?;
+                let prompt = cx
+                    .background_spawn(async move {
+                        generate_amp_prompt_for_unstamped_review_comments(repo, review_key)
+                    })
+                    .await?;
+
+                workspace.update(cx, |workspace, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(prompt));
+                    workspace.show_toast(
+                        Toast::new(
+                            copy_amp_prompt_notification_id(),
+                            "Copied Amp prompt for unstamped review comments.",
+                        )
+                        .autohide(),
+                        cx,
+                    );
+                })?;
+                anyhow::Ok(())
+            })
+            .detach_and_notify_err(error_workspace, window, cx);
     }
 
     fn archive_review_comments(
@@ -1797,6 +1883,37 @@ impl ProjectDiff {
         }
         result
     }
+}
+
+fn generate_amp_prompt_for_unstamped_review_comments(
+    repo: String,
+    review_key: String,
+) -> Result<String> {
+    let home = std::env::var_os("HOME").context("$HOME is not set")?;
+    let script_path = std::path::PathBuf::from(home).join(".config/scripts/zed-review");
+    let output = Command::new(&script_path)
+        .arg("--repo")
+        .arg(&repo)
+        .arg("prompt")
+        .arg("--review-key")
+        .arg(&review_key)
+        .arg("--author")
+        .arg("vxio")
+        .arg("--round")
+        .arg("new")
+        .arg("--stamp")
+        .current_dir(&repo)
+        .output()
+        .with_context(|| format!("running {}", script_path.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let message = if stderr.is_empty() { stdout } else { stderr };
+        return Err(anyhow!("zed-review prompt failed: {message}"));
+    }
+
+    String::from_utf8(output.stdout).context("zed-review prompt returned invalid UTF-8")
 }
 
 const CONFLICT_SORT_PREFIX: u64 = 1;
@@ -3358,6 +3475,19 @@ impl Render for BranchDiffToolbar {
                     ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.dispatch_action(&RefreshDiff, window, cx);
+                    })),
+            )
+            .child(
+                IconButton::new("copy-amp-prompt", IconName::ToolCopy)
+                    .shape(ui::IconButtonShape::Square)
+                    .tooltip(Tooltip::for_action_title_in(
+                        "Copy Amp Prompt for Unstamped Review Comments",
+                        &CopyAmpPromptForUnstampedReviewComments,
+                        &focus_handle,
+                    ))
+                    .disabled(review_count == 0)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.dispatch_action(&CopyAmpPromptForUnstampedReviewComments, window, cx);
                     })),
             )
             .child(
