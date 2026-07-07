@@ -42196,6 +42196,8 @@ fn test_review_comment_marked_outdated_after_line_removed(cx: &mut TestAppContex
                 comments["comments"][0]["outdated_reason"],
                 "line_not_in_diff"
             );
+            assert_eq!(editor.orphaned_review_comment_summaries().len(), 1);
+            assert!(editor.stored_review_comments.is_empty());
         })
         .unwrap();
 }
@@ -42707,7 +42709,7 @@ fn test_review_comment_agent_feedback_label(cx: &mut TestAppContext) {
                 "unlabeled comments must omit the field"
             );
 
-            editor.add_review_reply(id, "reply needs a feedback entry".to_string(), cx);
+            editor.add_review_reply(id, "reply needs a feedback entry".to_string(), false, cx);
             let parsed: serde_json::Value =
                 serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
             let reply_id = parsed["comments"][0]["replies"][0]["id"].as_u64().unwrap() as usize;
@@ -42738,6 +42740,34 @@ fn test_review_comment_agent_feedback_label(cx: &mut TestAppContext) {
                     .get("agent_feedback")
                     .is_none(),
                 "unlabeled replies must omit the field"
+            );
+
+            editor.reply_to_review_comment(
+                &crate::actions::ReplyToReviewComment { id },
+                window,
+                cx,
+            );
+            editor.toggle_agent_feedback(&crate::actions::ToggleAgentFeedback, window, cx);
+            assert_eq!(
+                editor.diff_review_overlays[0].reply_agent_feedback[&id],
+                true
+            );
+            let reply_editor = editor.diff_review_overlays[0].reply_editors[&id].clone();
+            reply_editor.update(cx, |reply_editor, cx| {
+                reply_editor.insert("new reply needs feedback", window, cx);
+            });
+            editor.submit_review_reply(id, window, cx);
+            assert!(
+                !editor.diff_review_overlays[0]
+                    .reply_agent_feedback
+                    .contains_key(&id),
+                "submitting must reset the pending reply flag"
+            );
+            let parsed: serde_json::Value =
+                serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
+            assert_eq!(
+                parsed["comments"][0]["replies"][1]["agent_feedback"], true,
+                "reply composer label must serialize on the submitted reply"
             );
         })
         .unwrap();

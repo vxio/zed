@@ -1467,6 +1467,7 @@ pub(super) struct DiffReviewOverlay {
     pub(super) inline_reply_edit_subscriptions: HashMap<usize, Subscription>,
     pub(super) reply_editors: HashMap<usize, Entity<Editor>>,
     pub(super) reply_subscriptions: HashMap<usize, Subscription>,
+    pub(super) reply_agent_feedback: HashMap<usize, bool>,
     pub(super) body_editors: HashMap<usize, Entity<Editor>>,
     pub(super) reply_body_editors: HashMap<usize, Entity<Editor>>,
     pub(super) user_avatar_uri: Option<SharedUri>,
@@ -2285,6 +2286,7 @@ impl Editor {
             inline_reply_edit_subscriptions: HashMap::default(),
             reply_editors: HashMap::default(),
             reply_subscriptions: HashMap::default(),
+            reply_agent_feedback: HashMap::default(),
             body_editors: HashMap::default(),
             reply_body_editors: HashMap::default(),
             user_avatar_uri,
@@ -2427,16 +2429,30 @@ impl Editor {
             })
             .collect::<Vec<_>>();
 
+        let mut orphaned_comments = Vec::new();
         for ((_, comments), reasons) in self.stored_review_comments.iter_mut().zip(stale_reasons) {
-            for (comment, reason) in comments.iter_mut().zip(reasons) {
-                let outdated = reason.is_some();
-                if comment.outdated != outdated || comment.outdated_reason != reason {
-                    comment.outdated = outdated;
-                    comment.outdated_reason = reason;
+            let mut retained_comments = Vec::with_capacity(comments.len());
+            for (mut comment, reason) in comments.drain(..).zip(reasons) {
+                if let Some(reason) = reason {
+                    comment.outdated = true;
+                    comment.outdated_reason = Some(reason);
+                    orphaned_comments.push(Self::review_comment_snapshot(&comment));
                     changed = true;
+                } else {
+                    if comment.outdated || comment.outdated_reason.is_some() {
+                        comment.outdated = false;
+                        comment.outdated_reason = None;
+                        changed = true;
+                    }
+                    retained_comments.push(comment);
                 }
             }
+            *comments = retained_comments;
         }
+
+        self.stored_review_comments
+            .retain(|(_, comments)| !comments.is_empty());
+        self.orphaned_review_comments.extend(orphaned_comments);
 
         if changed {
             cx.emit(EditorEvent::ReviewCommentsChanged {
@@ -3062,6 +3078,26 @@ impl Editor {
         }
     }
 
+    pub(super) fn toggle_reply_prompt_agent_feedback(
+        &mut self,
+        comment_id: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(hunk_key) = self.hunk_key_for_review_comment(comment_id) else {
+            return;
+        };
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        if let Some(overlay) = self
+            .diff_review_overlays
+            .iter_mut()
+            .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
+        {
+            let agent_feedback = overlay.reply_agent_feedback.entry(comment_id).or_default();
+            *agent_feedback = !*agent_feedback;
+            cx.notify();
+        }
+    }
+
     pub(super) fn cancel_diff_review_prompt(
         &mut self,
         hunk_key: &DiffHunkKey,
@@ -3308,6 +3344,7 @@ impl Editor {
         &mut self,
         comment_id: usize,
         reply: String,
+        agent_feedback: bool,
         cx: &mut Context<Self>,
     ) -> bool {
         let id = self.next_review_reply_id;
@@ -3324,7 +3361,7 @@ impl Editor {
                 created_at: current_review_comment_timestamp(),
                 body: reply,
                 review_round: None,
-                agent_feedback: false,
+                agent_feedback,
             });
             cx.emit(EditorEvent::ReviewCommentsChanged {
                 total_count: self.total_review_comment_count(),
@@ -3343,7 +3380,7 @@ impl Editor {
                     comment: reply,
                     is_editing: false,
                     review_round: None,
-                    agent_feedback: false,
+                    agent_feedback,
                 });
                 cx.emit(EditorEvent::ReviewCommentsChanged {
                     total_count: self.total_review_comment_count(),
@@ -3633,6 +3670,20 @@ impl Editor {
         }) {
             overlay.prompt_agent_feedback = !overlay.prompt_agent_feedback;
             cx.notify();
+            return;
+        }
+        if let Some(comment_id) = self.diff_review_overlays.iter().find_map(|overlay| {
+            overlay
+                .reply_editors
+                .iter()
+                .find_map(|(comment_id, editor)| {
+                    editor
+                        .focus_handle(cx)
+                        .is_focused(window)
+                        .then_some(*comment_id)
+                })
+        }) {
+            self.toggle_reply_prompt_agent_feedback(comment_id, cx);
             return;
         }
         if let Some(id) = self.current_review_comment_id(cx) {
@@ -4283,10 +4334,17 @@ impl Editor {
             .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
             .and_then(|overlay| overlay.reply_editors.get(&comment_id))
             .map(|editor| editor.read(cx).text(cx).trim().to_string());
+        let agent_feedback = self
+            .diff_review_overlays
+            .iter()
+            .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
+            .and_then(|overlay| overlay.reply_agent_feedback.get(&comment_id))
+            .copied()
+            .unwrap_or(false);
 
         if let Some(reply_text) = reply_text {
             if !reply_text.is_empty() {
-                self.add_review_reply(comment_id, reply_text, cx);
+                self.add_review_reply(comment_id, reply_text, agent_feedback, cx);
             }
         }
 
@@ -4310,6 +4368,7 @@ impl Editor {
         {
             overlay.reply_editors.remove(&comment_id);
             overlay.reply_subscriptions.remove(&comment_id);
+            overlay.reply_agent_feedback.remove(&comment_id);
         }
 
         self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
@@ -5764,6 +5823,7 @@ impl Editor {
             inline_editors,
             inline_reply_editors,
             reply_editors,
+            reply_agent_feedback_by_comment,
             body_editors,
             reply_body_editors,
             user_avatar_uri,
@@ -5781,6 +5841,7 @@ impl Editor {
                     editors,
                     inline_reply_editors,
                     reply_editors,
+                    reply_agent_feedback,
                     body_editors,
                     reply_body_editors,
                     avatar_uri,
@@ -5808,6 +5869,7 @@ impl Editor {
                             o.inline_edit_editors.clone(),
                             o.inline_reply_edit_editors.clone(),
                             o.reply_editors.clone(),
+                            o.reply_agent_feedback.clone(),
                             o.body_editors.clone(),
                             o.reply_body_editors.clone(),
                             o.user_avatar_uri.clone(),
@@ -5827,6 +5889,7 @@ impl Editor {
                         HashMap::default(),
                         HashMap::default(),
                         HashMap::default(),
+                        HashMap::default(),
                         None,
                         None,
                     ));
@@ -5838,6 +5901,7 @@ impl Editor {
                     editors,
                     inline_reply_editors,
                     reply_editors,
+                    reply_agent_feedback,
                     body_editors,
                     reply_body_editors,
                     avatar_uri,
@@ -5849,6 +5913,7 @@ impl Editor {
                 true,
                 false,
                 false,
+                HashMap::default(),
                 HashMap::default(),
                 HashMap::default(),
                 HashMap::default(),
@@ -6025,6 +6090,7 @@ impl Editor {
                     inline_editors,
                     inline_reply_editors,
                     reply_editors,
+                    reply_agent_feedback_by_comment,
                     body_editors,
                     reply_body_editors,
                     user_avatar_uri,
@@ -6044,6 +6110,7 @@ impl Editor {
         inline_editors: HashMap<usize, Entity<Editor>>,
         inline_reply_editors: HashMap<usize, Entity<Editor>>,
         reply_editors: HashMap<usize, Entity<Editor>>,
+        reply_agent_feedback_by_comment: HashMap<usize, bool>,
         body_editors: HashMap<usize, Entity<Editor>>,
         reply_body_editors: HashMap<usize, Entity<Editor>>,
         user_avatar_uri: Option<SharedUri>,
@@ -6114,6 +6181,10 @@ impl Editor {
                     let inline_editor = inline_editors.get(&comment.id).cloned();
                     let inline_reply_editors = inline_reply_editors.clone();
                     let reply_editor = reply_editors.get(&comment.id).cloned();
+                    let reply_agent_feedback = reply_agent_feedback_by_comment
+                        .get(&comment.id)
+                        .copied()
+                        .unwrap_or(false);
                     let body_editor = body_editors.get(&comment.id).cloned();
                     let reply_body_editors = reply_body_editors.clone();
                     Self::render_comment_row(
@@ -6121,6 +6192,7 @@ impl Editor {
                         inline_editor,
                         inline_reply_editors,
                         reply_editor,
+                        reply_agent_feedback,
                         body_editor,
                         reply_body_editors,
                         user_avatar_uri.clone(),
@@ -6138,6 +6210,7 @@ impl Editor {
         inline_editor: Option<Entity<Editor>>,
         inline_reply_editors: HashMap<usize, Entity<Editor>>,
         reply_editor: Option<Entity<Editor>>,
+        reply_agent_feedback: bool,
         body_editor: Option<Entity<Editor>>,
         reply_body_editors: HashMap<usize, Entity<Editor>>,
         user_avatar_uri: Option<SharedUri>,
@@ -6166,6 +6239,7 @@ impl Editor {
         let copy_editor_handle = editor_handle.clone();
         let body_editor_handle = editor_handle.clone();
         let cancel_reply_editor_handle = editor_handle.clone();
+        let agent_feedback_reply_editor_handle = editor_handle.clone();
         let submit_reply_editor_handle = editor_handle.clone();
         let delete_editor_handle = editor_handle.clone();
         let resolve_editor_handle = editor_handle.clone();
@@ -6968,6 +7042,38 @@ impl Editor {
                             h_flex()
                                 .flex_shrink_0()
                                 .gap_1()
+                                .child(
+                                    IconButton::new(
+                                        format!("diff-review-reply-agent-feedback-{comment_id}"),
+                                        IconName::ToolHammer,
+                                    )
+                                    .icon_color(if reply_agent_feedback {
+                                        ui::Color::Accent
+                                    } else {
+                                        ui::Color::Muted
+                                    })
+                                    .icon_size(action_icon_size)
+                                    .size(ButtonSize::Medium)
+                                    .toggle_state(reply_agent_feedback)
+                                    .tooltip(Tooltip::text(if reply_agent_feedback {
+                                        "Unmark reply for agent-feedback"
+                                    } else {
+                                        "Mark reply for agent-feedback"
+                                    }))
+                                    .on_click(
+                                        move |_, _window, cx| {
+                                            if let Some(editor) =
+                                                agent_feedback_reply_editor_handle.upgrade()
+                                            {
+                                                editor.update(cx, |editor, cx| {
+                                                    editor.toggle_reply_prompt_agent_feedback(
+                                                        comment_id, cx,
+                                                    );
+                                                });
+                                            }
+                                        },
+                                    ),
+                                )
                                 .child(
                                     IconButton::new(
                                         format!("diff-review-cancel-reply-{comment_id}"),

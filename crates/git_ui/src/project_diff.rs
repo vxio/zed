@@ -2243,6 +2243,130 @@ fn merge_review_comments_json(
     Ok((merged_json, restored_count))
 }
 
+fn merge_review_comments_for_save(
+    existing_comments_json: Option<&str>,
+    incoming_comments_json: &str,
+) -> anyhow::Result<String> {
+    let Some(existing_comments_json) = existing_comments_json else {
+        return Ok(incoming_comments_json.to_string());
+    };
+
+    let existing_snapshot: serde_json::Value =
+        serde_json::from_str(existing_comments_json).context("deserializing existing comments")?;
+    let incoming_snapshot: serde_json::Value =
+        serde_json::from_str(incoming_comments_json).context("deserializing incoming comments")?;
+    let schema_version = incoming_snapshot
+        .get("schema_version")
+        .and_then(|version| version.as_u64())
+        .or_else(|| {
+            existing_snapshot
+                .get("schema_version")
+                .and_then(|version| version.as_u64())
+        })
+        .unwrap_or(1);
+    let existing_comments = existing_snapshot
+        .get("comments")
+        .and_then(|comments| comments.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut incoming_comments = incoming_snapshot
+        .get("comments")
+        .and_then(|comments| comments.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut next_reply_id = existing_comments
+        .iter()
+        .chain(incoming_comments.iter())
+        .filter_map(|comment| {
+            comment
+                .get("replies")
+                .and_then(|replies| replies.as_array())
+        })
+        .flatten()
+        .filter_map(|reply| reply.get("id").and_then(|id| id.as_i64()))
+        .max()
+        .unwrap_or(999)
+        + 1;
+
+    for existing_comment in existing_comments {
+        let Some(existing_id) = existing_comment.get("id").and_then(|id| id.as_i64()) else {
+            continue;
+        };
+        let Some(incoming_comment) = incoming_comments
+            .iter_mut()
+            .find(|comment| comment.get("id").and_then(|id| id.as_i64()) == Some(existing_id))
+        else {
+            incoming_comments.push(existing_comment);
+            continue;
+        };
+
+        merge_review_comment_replies(incoming_comment, existing_comment, &mut next_reply_id);
+    }
+
+    Ok(serde_json::json!({
+        "schema_version": schema_version,
+        "comments": incoming_comments,
+    })
+    .to_string())
+}
+
+fn merge_review_comment_replies(
+    incoming_comment: &mut serde_json::Value,
+    existing_comment: serde_json::Value,
+    next_reply_id: &mut i64,
+) {
+    let existing_replies = existing_comment
+        .get("replies")
+        .and_then(|replies| replies.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if existing_replies.is_empty() {
+        return;
+    }
+
+    let Some(incoming_object) = incoming_comment.as_object_mut() else {
+        return;
+    };
+    let incoming_replies = incoming_object
+        .entry("replies")
+        .or_insert_with(|| serde_json::json!([]));
+    let Some(incoming_replies) = incoming_replies.as_array_mut() else {
+        return;
+    };
+
+    let mut merged_replies = existing_replies;
+    for incoming_reply in incoming_replies.drain(..) {
+        let Some(incoming_id) = incoming_reply.get("id").and_then(|id| id.as_i64()) else {
+            merged_replies.push(incoming_reply);
+            continue;
+        };
+        if let Some(existing_reply) = merged_replies
+            .iter_mut()
+            .find(|reply| reply.get("id").and_then(|id| id.as_i64()) == Some(incoming_id))
+        {
+            if review_replies_match(existing_reply, &incoming_reply) {
+                *existing_reply = incoming_reply;
+            } else {
+                let mut incoming_reply = incoming_reply;
+                if let Some(reply_object) = incoming_reply.as_object_mut() {
+                    reply_object.insert("id".to_string(), serde_json::json!(*next_reply_id));
+                    *next_reply_id += 1;
+                }
+                merged_replies.push(incoming_reply);
+            }
+        } else {
+            merged_replies.push(incoming_reply);
+        }
+    }
+
+    *incoming_replies = merged_replies;
+}
+
+fn review_replies_match(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    left.get("author") == right.get("author") && left.get("body") == right.get("body")
+}
+
 fn unix_time_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2660,7 +2784,12 @@ impl ProjectDiff {
                     .child(Label::new(title).size(LabelSize::Small).color(Color::Muted)),
             )
             .when(expanded, |el| {
-                el.children(comments.into_iter().map(|comment| {
+                let mut list = v_flex().w_full().gap_1().max_h_32();
+                gpui::InteractiveElement::interactivity(&mut list)
+                    .base_style
+                    .overflow
+                    .y = Some(gpui::Overflow::Scroll);
+                el.child(list.children(comments.into_iter().map(|comment| {
                     let line = if comment.line_start == comment.line_end {
                         format!("{}:{}", comment.file, comment.line_start)
                     } else {
@@ -2714,7 +2843,7 @@ impl ProjectDiff {
                                 }),
                         )
                         .child(Label::new(comment.body).size(LabelSize::Small))
-                }))
+                })))
             })
             .into_any_element()
     }
@@ -2912,6 +3041,20 @@ mod persistence {
             comments_json: String,
         ) -> impl Future<Output = anyhow::Result<()>> + use<> {
             self.write(move |connection| {
+                let select_sql = sql!(
+                    SELECT comments_json FROM project_diff_review_comments
+                    WHERE workspace_id = ? AND review_key = ? AND session_id = "active" AND archived_on IS NULL
+                );
+                let mut select_existing =
+                    connection.select_bound::<(WorkspaceId, String), String>(select_sql)?;
+                let existing_comments_json = select_existing((workspace_id, review_key.clone()))?
+                    .into_iter()
+                    .next();
+                let comments_json = super::merge_review_comments_for_save(
+                    existing_comments_json.as_deref(),
+                    &comments_json,
+                )?;
+
                 let sql_stmt = sql!(
                     INSERT INTO project_diff_review_comments(
                         workspace_id,
@@ -3948,6 +4091,89 @@ mod tests {
                 .and_then(|id| id.as_i64()),
             Some(1001)
         );
+    }
+
+    #[test]
+    fn test_merge_review_comments_for_save_preserves_external_replies() {
+        let existing_json = serde_json::json!({
+            "schema_version": 1,
+            "comments": [{
+                "id": 0,
+                "author": "vxio",
+                "file": "foo.txt",
+                "side": "new",
+                "hunk_line": 1,
+                "line_start": 1,
+                "line_end": 1,
+                "body": "review",
+                "replies": [{ "id": 1000, "author": "amp", "body": "👍 fixed" }]
+            }]
+        })
+        .to_string();
+        let incoming_json = serde_json::json!({
+            "schema_version": 1,
+            "comments": [{
+                "id": 0,
+                "author": "vxio",
+                "file": "foo.txt",
+                "side": "new",
+                "hunk_line": 1,
+                "line_start": 1,
+                "line_end": 1,
+                "body": "review",
+                "replies": []
+            }]
+        })
+        .to_string();
+
+        let merged = merge_review_comments_for_save(Some(&existing_json), &incoming_json).unwrap();
+        let merged: serde_json::Value = serde_json::from_str(&merged).unwrap();
+
+        assert_eq!(merged["comments"][0]["replies"][0]["body"], "👍 fixed");
+    }
+
+    #[test]
+    fn test_merge_review_comments_for_save_keeps_both_reply_id_collisions() {
+        let existing_json = serde_json::json!({
+            "schema_version": 1,
+            "comments": [{
+                "id": 0,
+                "author": "vxio",
+                "file": "foo.txt",
+                "side": "new",
+                "hunk_line": 1,
+                "line_start": 1,
+                "line_end": 1,
+                "body": "review",
+                "replies": [{ "id": 1000, "author": "amp", "body": "👍 fixed" }]
+            }]
+        })
+        .to_string();
+        let incoming_json = serde_json::json!({
+            "schema_version": 1,
+            "comments": [{
+                "id": 0,
+                "author": "vxio",
+                "file": "foo.txt",
+                "side": "new",
+                "hunk_line": 1,
+                "line_start": 1,
+                "line_end": 1,
+                "body": "review",
+                "replies": [{ "id": 1000, "author": "vxio", "body": "why didn't you reply?" }]
+            }]
+        })
+        .to_string();
+
+        let merged = merge_review_comments_for_save(Some(&existing_json), &incoming_json).unwrap();
+        let merged: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        let replies = merged["comments"][0]["replies"].as_array().unwrap();
+
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0]["id"], 1000);
+        assert_eq!(replies[0]["body"], "👍 fixed");
+        assert_eq!(replies[1]["id"], 1001);
+        assert_eq!(replies[1]["body"], "why didn't you reply?");
     }
 
     #[gpui::test]
