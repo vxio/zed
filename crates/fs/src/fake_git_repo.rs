@@ -69,6 +69,7 @@ pub struct FakeGitRepositoryState {
     pub blames_at_revision: HashMap<(RepoPath, Oid), Blame>,
     pub current_branch_name: Option<String>,
     pub branches: HashSet<String>,
+    pub default_branch: Option<String>,
     /// List of remotes, keys are names and values are URLs
     pub remotes: HashMap<String, String>,
     pub simulated_index_write_error_message: Option<String>,
@@ -94,6 +95,7 @@ impl FakeGitRepositoryState {
             blames_at_revision: Default::default(),
             current_branch_name: Default::default(),
             branches: Default::default(),
+            default_branch: Some("origin/main".into()),
             simulated_index_write_error_message: Default::default(),
             simulated_create_worktree_error: Default::default(),
             simulated_graph_error: None,
@@ -1509,14 +1511,19 @@ impl GitRepository for FakeGitRepository {
         &self,
         include_remote_name: bool,
     ) -> BoxFuture<'_, Result<Option<SharedString>>> {
-        async move {
-            Ok(Some(if include_remote_name {
-                "origin/main".into()
-            } else {
-                "main".into()
+        self.with_state_async(false, move |state| {
+            Ok(state.default_branch.as_ref().map(|branch| {
+                if include_remote_name {
+                    SharedString::from(branch.clone())
+                } else {
+                    branch
+                        .strip_prefix("origin/")
+                        .unwrap_or(branch)
+                        .to_string()
+                        .into()
+                }
             }))
-        }
-        .boxed()
+        })
     }
 
     fn create_remote(&self, name: String, url: String) -> BoxFuture<'_, Result<()>> {

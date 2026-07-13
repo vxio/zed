@@ -2,6 +2,7 @@ use crate::{
     branch_picker, conflict_view,
     git_panel::{GitPanel, GitPanelAddon, GitStatusEntry},
     git_panel_settings::GitPanelSettings,
+    picker_prompt,
 };
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
@@ -97,6 +98,8 @@ actions!(
         ArchiveUserReviewComments,
         /// Archives agent-authored review comments and clears them from the current diff.
         ArchiveAgentReviewComments,
+        /// Archives review comments for a selected review round and clears them from the current diff.
+        ArchiveReviewRoundComments,
         /// Deletes all review comments after confirmation by archiving them.
         DeleteReviewComments,
         /// Restores the newest archived review comment session.
@@ -105,6 +108,8 @@ actions!(
         RestoreLatestUserReviewComments,
         /// Restores the newest archived agent-authored review comment session.
         RestoreLatestAgentReviewComments,
+        /// Restores archived review comments for a selected review round.
+        RestoreReviewRoundComments,
         /// Copies an Amp prompt for addressing unstamped review comments.
         CopyAmpPromptForUnstampedReviewComments,
     ]
@@ -125,6 +130,7 @@ pub struct ProjectDiff {
     last_review_comments_db_modified_on: Option<SystemTime>,
     restoring_review_comments: bool,
     review_comments_fully_restored: bool,
+    copy_amp_prompt_in_progress: bool,
     orphaned_review_comments_expanded: bool,
     follows_default_branch: bool,
     _task: Task<Result<()>>,
@@ -145,6 +151,7 @@ enum ReviewCommentArchiveScope {
     User,
     Agent,
     Deleted,
+    Round(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +159,13 @@ enum RestoreLatestReviewCommentsResult {
     Restored,
     NoArchivedComments,
     Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyAmpPromptResult {
+    Started,
+    AlreadyInProgress,
+    Unavailable,
 }
 
 fn restore_latest_review_comments_notification_id() -> NotificationId {
@@ -163,12 +177,13 @@ fn copy_amp_prompt_notification_id() -> NotificationId {
 }
 
 impl ReviewCommentArchiveScope {
-    fn as_str(self) -> &'static str {
+    fn archive_scope(self) -> String {
         match self {
-            Self::All => "all",
-            Self::User => "user",
-            Self::Agent => "agent",
-            Self::Deleted => "deleted",
+            Self::All => "all".to_string(),
+            Self::User => "user".to_string(),
+            Self::Agent => "agent".to_string(),
+            Self::Deleted => "deleted".to_string(),
+            Self::Round(round) => format!("round:{round}"),
         }
     }
 
@@ -177,6 +192,7 @@ impl ReviewCommentArchiveScope {
             Self::All | Self::Deleted => true,
             Self::User => comment_author(comment) == "vxio",
             Self::Agent => comment_author(comment) == "amp",
+            Self::Round(round) => review_comment_contains_round(comment, round),
         }
     }
 }
@@ -186,6 +202,22 @@ fn comment_author(comment: &serde_json::Value) -> &str {
         .get("author")
         .and_then(|author| author.as_str())
         .unwrap_or("vxio")
+}
+
+fn review_comment_contains_round(comment: &serde_json::Value, round: u64) -> bool {
+    comment_review_round(comment) == Some(round)
+        || comment
+            .get("replies")
+            .and_then(|replies| replies.as_array())
+            .is_some_and(|replies| {
+                replies
+                    .iter()
+                    .any(|reply| comment_review_round(reply) == Some(round))
+            })
+}
+
+fn comment_review_round(comment: &serde_json::Value) -> Option<u64> {
+    comment.get("review_round").and_then(|round| round.as_u64())
 }
 
 impl ProjectDiff {
@@ -217,6 +249,9 @@ impl ProjectDiff {
                 window,
                 cx,
             );
+        });
+        workspace.register_action(|workspace, _: &ArchiveReviewRoundComments, window, cx| {
+            Self::archive_active_review_round_comments(workspace, window, cx);
         });
         workspace.register_action(|workspace, _: &DeleteReviewComments, window, cx| {
             Self::delete_active_review_comments(workspace, window, cx);
@@ -257,6 +292,9 @@ impl ProjectDiff {
                 );
             },
         );
+        workspace.register_action(|workspace, _: &RestoreReviewRoundComments, window, cx| {
+            Self::restore_active_review_round_comments(workspace, window, cx);
+        });
         workspace.register_action(
             |workspace, _: &CopyAmpPromptForUnstampedReviewComments, window, cx| {
                 Self::copy_active_amp_prompt_for_unstamped_review_comments(workspace, window, cx);
@@ -299,6 +337,40 @@ impl ProjectDiff {
         });
     }
 
+    fn archive_active_review_round_comments(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(workspace_id) = workspace.database_id() else {
+            return;
+        };
+        let Some(project_diff) = workspace.active_item_as::<ProjectDiff>(cx) else {
+            return;
+        };
+        let rounds = project_diff.update(cx, |project_diff, cx| {
+            project_diff.active_review_comment_rounds(cx)
+        });
+        Self::prompt_for_review_round(
+            workspace,
+            rounds,
+            "Archive review round",
+            "No review rounds found in the current diff.",
+            window,
+            cx,
+            move |round, window, cx| {
+                project_diff.update(cx, |project_diff, cx| {
+                    project_diff.archive_review_comments(
+                        workspace_id,
+                        ReviewCommentArchiveScope::Round(round),
+                        window,
+                        cx,
+                    );
+                });
+            },
+        );
+    }
+
     fn restore_latest_active_review_comments(
         workspace: &mut Workspace,
         scope: Option<ReviewCommentArchiveScope>,
@@ -330,6 +402,82 @@ impl ProjectDiff {
         }
     }
 
+    fn restore_active_review_round_comments(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(workspace_id) = workspace.database_id() else {
+            return;
+        };
+        let Some(project_diff) = workspace.active_item_as::<ProjectDiff>(cx) else {
+            return;
+        };
+        let rounds = project_diff.update(cx, |project_diff, cx| {
+            project_diff.archived_review_comment_rounds(workspace_id, cx)
+        });
+        Self::prompt_for_review_round(
+            workspace,
+            rounds,
+            "Restore review round",
+            "No archived review rounds found for this diff.",
+            window,
+            cx,
+            move |round, window, cx| {
+                let result = project_diff.update(cx, |project_diff, cx| {
+                    project_diff.restore_latest_review_comments(
+                        workspace_id,
+                        Some(ReviewCommentArchiveScope::Round(round)),
+                        window,
+                        cx,
+                    )
+                });
+                if result == RestoreLatestReviewCommentsResult::NoArchivedComments {
+                    log::warn!("no archived Review #{round} comments found for this diff");
+                }
+            },
+        );
+    }
+
+    fn prompt_for_review_round(
+        workspace: &mut Workspace,
+        rounds: Vec<u64>,
+        title: &'static str,
+        empty_message: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+        on_select: impl FnOnce(u64, &mut Window, &mut App) + 'static,
+    ) {
+        if rounds.is_empty() {
+            workspace.show_toast(
+                Toast::new(
+                    restore_latest_review_comments_notification_id(),
+                    empty_message,
+                )
+                .autohide(),
+                cx,
+            );
+            return;
+        }
+
+        let options = rounds
+            .iter()
+            .map(|round| format!("Review #{round}"))
+            .map(SharedString::from)
+            .collect::<Vec<_>>();
+
+        let prompt = picker_prompt::prompt(title, options, workspace.weak_handle(), window, cx);
+        cx.spawn_in(window, async move |_workspace, cx| {
+            let Some(selection) = prompt.await else {
+                return;
+            };
+            if let Some(round) = rounds.get(selection).copied() {
+                cx.update(|window, cx| on_select(round, window, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
     fn copy_active_amp_prompt_for_unstamped_review_comments(
         workspace: &mut Workspace,
         window: &mut Window,
@@ -341,9 +489,30 @@ impl ProjectDiff {
         let Some(project_diff) = workspace.active_item_as::<ProjectDiff>(cx) else {
             return;
         };
-        project_diff.update(cx, |project_diff, cx| {
-            project_diff.copy_amp_prompt_for_unstamped_review_comments(workspace_id, window, cx);
+        let result = project_diff.update(cx, |project_diff, cx| {
+            project_diff.copy_amp_prompt_for_unstamped_review_comments(workspace_id, window, cx)
         });
+        match result {
+            CopyAmpPromptResult::Started => {
+                workspace.show_toast(
+                    Toast::new(
+                        copy_amp_prompt_notification_id(),
+                        "Generating Amp prompt for unstamped review comments…",
+                    ),
+                    cx,
+                );
+            }
+            CopyAmpPromptResult::AlreadyInProgress => {
+                workspace.show_toast(
+                    Toast::new(
+                        copy_amp_prompt_notification_id(),
+                        "Still generating Amp prompt…",
+                    ),
+                    cx,
+                );
+            }
+            CopyAmpPromptResult::Unavailable => {}
+        }
     }
 
     fn delete_active_review_comments(
@@ -788,9 +957,9 @@ impl ProjectDiff {
         workspace_id: workspace::WorkspaceId,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> CopyAmpPromptResult {
         let Some(review_key) = self.review_comments_key(cx) else {
-            return;
+            return CopyAmpPromptResult::Unavailable;
         };
         let Some(repo) = review_key
             .lines()
@@ -798,7 +967,7 @@ impl ProjectDiff {
             .filter(|repo| !repo.is_empty())
             .map(ToOwned::to_owned)
         else {
-            return;
+            return CopyAmpPromptResult::Unavailable;
         };
         let Ok(comments_json) = self
             .editor
@@ -807,37 +976,71 @@ impl ProjectDiff {
             .read(cx)
             .review_comments_json(cx)
         else {
-            return;
+            return CopyAmpPromptResult::Unavailable;
         };
+
+        if self.copy_amp_prompt_in_progress {
+            return CopyAmpPromptResult::AlreadyInProgress;
+        }
+
+        self.copy_amp_prompt_in_progress = true;
+        cx.notify();
 
         let db = persistence::ProjectDiffDb::global(cx);
         let workspace = self.workspace.clone();
         let error_workspace = self.workspace.clone();
+        let this = cx.entity().downgrade();
         window
             .spawn(cx, async move |cx| {
-                db.save_review_comments(workspace_id, review_key.clone(), comments_json)
-                    .await
-                    .context("saving review comments before generating Amp prompt")?;
-                let prompt = cx
-                    .background_spawn(async move {
-                        generate_amp_prompt_for_unstamped_review_comments(repo, review_key)
-                    })
-                    .await?;
+                let result = async {
+                    db.save_review_comments(workspace_id, review_key.clone(), comments_json)
+                        .await
+                        .context("saving review comments before generating Amp prompt")?;
+                    let prompt = cx
+                        .background_spawn(async move {
+                            generate_amp_prompt_for_unstamped_review_comments(repo, review_key)
+                        })
+                        .await?;
 
-                workspace.update(cx, |workspace, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(prompt));
-                    workspace.show_toast(
-                        Toast::new(
-                            copy_amp_prompt_notification_id(),
-                            "Copied Amp prompt for unstamped review comments.",
-                        )
-                        .autohide(),
-                        cx,
-                    );
-                })?;
-                anyhow::Ok(())
+                    workspace.update(cx, |workspace, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(prompt));
+                        workspace.show_toast(
+                            Toast::new(
+                                copy_amp_prompt_notification_id(),
+                                "Copied Amp prompt to clipboard.",
+                            )
+                            .autohide(),
+                            cx,
+                        );
+                    })?;
+                    anyhow::Ok(())
+                }
+                .await;
+
+                this.update(cx, |this, cx| {
+                    this.copy_amp_prompt_in_progress = false;
+                    cx.notify();
+                })
+                .ok();
+
+                if result.is_err() {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.show_toast(
+                            Toast::new(
+                                copy_amp_prompt_notification_id(),
+                                "Failed to copy Amp prompt.",
+                            )
+                            .autohide(),
+                            cx,
+                        );
+                    })?;
+                }
+
+                result
             })
             .detach_and_notify_err(error_workspace, window, cx);
+
+        CopyAmpPromptResult::Started
     }
 
     fn archive_review_comments(
@@ -870,7 +1073,8 @@ impl ProjectDiff {
         }
 
         let archived_on = unix_time_millis();
-        let session_id = format!("archived:{archived_on}:{}", scope.as_str());
+        let archive_scope = scope.archive_scope();
+        let session_id = format!("archived:{archived_on}:{archive_scope}");
         let db = persistence::ProjectDiffDb::global(cx);
         let archive = db.archive_review_comments(
             workspace_id,
@@ -879,7 +1083,7 @@ impl ProjectDiff {
             archived_json,
             remaining_json.clone(),
             archived_on,
-            scope.as_str().to_string(),
+            archive_scope,
         );
         cx.background_spawn(archive).detach_and_log_err(cx);
 
@@ -895,6 +1099,37 @@ impl ProjectDiff {
             })
         });
         self.restoring_review_comments = false;
+    }
+
+    fn active_review_comment_rounds(&self, cx: &App) -> Vec<u64> {
+        let Ok(comments_json) = self
+            .editor
+            .read(cx)
+            .rhs_editor()
+            .read(cx)
+            .review_comments_json(cx)
+        else {
+            return Vec::new();
+        };
+        review_comments_json_rounds(&comments_json)
+    }
+
+    fn archived_review_comment_rounds(
+        &self,
+        workspace_id: workspace::WorkspaceId,
+        cx: &App,
+    ) -> Vec<u64> {
+        let Some(review_key) = self.review_comments_key(cx) else {
+            return Vec::new();
+        };
+        let db = persistence::ProjectDiffDb::global(cx);
+        match db.archived_review_comment_rounds(workspace_id, &review_key) {
+            Ok(rounds) => rounds,
+            Err(error) => {
+                log::error!("failed to load archived review comment rounds: {error:#}");
+                Vec::new()
+            }
+        }
     }
 
     fn restore_latest_review_comments(
@@ -919,10 +1154,11 @@ impl ProjectDiff {
         };
 
         let db = persistence::ProjectDiffDb::global(cx);
+        let archive_scope = scope.map(|scope| scope.archive_scope());
         let Some((_session_id, comments_json)) = (match db.latest_archived_review_comments(
             workspace_id,
             &review_key,
-            scope.map(ReviewCommentArchiveScope::as_str),
+            archive_scope.as_deref(),
         ) {
             Ok(result) => result,
             Err(error) => {
@@ -1318,6 +1554,7 @@ impl ProjectDiff {
             last_review_comments_db_modified_on: None,
             restoring_review_comments: false,
             review_comments_fully_restored: true,
+            copy_amp_prompt_in_progress: false,
             orphaned_review_comments_expanded: false,
             follows_default_branch,
             _task: task,
@@ -2135,6 +2372,34 @@ fn partition_review_comments_json(
     Ok((archived_json, remaining_json, archived_count))
 }
 
+fn review_comments_json_rounds(comments_json: &str) -> Vec<u64> {
+    let Ok(snapshot) = serde_json::from_str::<serde_json::Value>(comments_json) else {
+        return Vec::new();
+    };
+    let Some(comments) = snapshot
+        .get("comments")
+        .and_then(|comments| comments.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut rounds = Vec::new();
+    for comment in comments {
+        if let Some(round) = comment_review_round(comment) {
+            rounds.push(round);
+        }
+        if let Some(replies) = comment
+            .get("replies")
+            .and_then(|replies| replies.as_array())
+        {
+            rounds.extend(replies.iter().filter_map(comment_review_round));
+        }
+    }
+    rounds.sort_unstable();
+    rounds.dedup();
+    rounds
+}
+
 fn merge_review_comments_json(
     active_comments_json: &str,
     archived_comments_json: &str,
@@ -2873,14 +3138,21 @@ impl SerializableItem for ProjectDiff {
     ) -> Task<Result<Entity<Self>>> {
         let db = persistence::ProjectDiffDb::global(cx);
         window.spawn(cx, async move |cx| {
-            let diff_base = db.get_diff_base(item_id, workspace_id)?;
+            let (diff_base, follows_default_branch) = db.get_diff_base(item_id, workspace_id)?;
 
             let diff = cx.update(|window, cx| {
                 let branch_diff = cx
                     .new(|cx| branch_diff::BranchDiff::new(diff_base, project.clone(), window, cx));
                 let workspace = workspace.upgrade().context("workspace gone")?;
                 anyhow::Ok(cx.new(|cx| {
-                    ProjectDiff::new_impl(branch_diff, project, workspace, false, window, cx)
+                    ProjectDiff::new_impl(
+                        branch_diff,
+                        project,
+                        workspace,
+                        follows_default_branch,
+                        window,
+                        cx,
+                    )
                 }))
             })??;
 
@@ -2897,12 +3169,18 @@ impl SerializableItem for ProjectDiff {
     ) -> Option<Task<Result<()>>> {
         let workspace_id = workspace.database_id()?;
         let diff_base = self.diff_base(cx).clone();
+        let follows_default_branch = self.follows_default_branch;
 
         let db = persistence::ProjectDiffDb::global(cx);
         Some(cx.background_spawn({
             async move {
-                db.save_diff_base(item_id, workspace_id, diff_base.clone())
-                    .await
+                db.save_diff_base(
+                    item_id,
+                    workspace_id,
+                    diff_base.clone(),
+                    follows_default_branch,
+                )
+                .await
             }
         }))
     }
@@ -2988,6 +3266,7 @@ mod persistence {
                 DROP TABLE project_diff_review_comments;
                 ALTER TABLE project_diff_review_comments_v2 RENAME TO project_diff_review_comments;
             ),
+            sql!(ALTER TABLE project_diffs ADD COLUMN follows_default_branch INTEGER DEFAULT 0;),
         ];
     }
 
@@ -2999,14 +3278,23 @@ mod persistence {
             item_id: ItemId,
             workspace_id: WorkspaceId,
             diff_base: DiffBase,
+            follows_default_branch: bool,
         ) -> anyhow::Result<()> {
             self.write(move |connection| {
                 let sql_stmt = sql!(
-                    INSERT OR REPLACE INTO project_diffs(item_id, workspace_id, diff_base) VALUES (?, ?, ?)
+                    INSERT OR REPLACE INTO project_diffs(item_id, workspace_id, diff_base, follows_default_branch) VALUES (?, ?, ?, ?)
                 );
                 let diff_base_str = serde_json::to_string(&diff_base)?;
-                let mut query = connection.exec_bound::<(ItemId, WorkspaceId, String)>(sql_stmt)?;
-                query((item_id, workspace_id, diff_base_str)).context(format!(
+                let follows_default_branch = i64::from(follows_default_branch);
+                let mut query = connection
+                    .exec_bound::<(ItemId, WorkspaceId, String, i64)>(sql_stmt)?;
+                query((
+                    item_id,
+                    workspace_id,
+                    diff_base_str,
+                    follows_default_branch,
+                ))
+                .context(format!(
                     "exec_bound failed to execute or parse for: {}",
                     sql_stmt
                 ))
@@ -3018,20 +3306,24 @@ mod persistence {
             &self,
             item_id: ItemId,
             workspace_id: WorkspaceId,
-        ) -> anyhow::Result<DiffBase> {
-            let sql_stmt =
-                sql!(SELECT diff_base FROM project_diffs WHERE item_id =  ?AND workspace_id =  ?);
-            let diff_base_str = self.select_row_bound::<(ItemId, WorkspaceId), String>(sql_stmt)?(
-                (item_id, workspace_id),
-            )
+        ) -> anyhow::Result<(DiffBase, bool)> {
+            let sql_stmt = sql!(
+                SELECT diff_base, follows_default_branch FROM project_diffs WHERE item_id =  ?AND workspace_id =  ?
+            );
+            let row = self.select_row_bound::<(ItemId, WorkspaceId), (String, i64)>(sql_stmt)?((
+                item_id,
+                workspace_id,
+            ))
             .context(::std::format!(
                 "Error in get_diff_base, select_row_bound failed to execute or parse for: {}",
                 sql_stmt
             ))?;
-            let Some(diff_base_str) = diff_base_str else {
-                return Ok(DiffBase::Head);
+            let Some((diff_base_str, follows_default_branch)) = row else {
+                return Ok((DiffBase::Head, false));
             };
-            serde_json::from_str(&diff_base_str).context("deserializing diff base")
+            let diff_base =
+                serde_json::from_str(&diff_base_str).context("deserializing diff base")?;
+            Ok((diff_base, follows_default_branch != 0))
         }
 
         pub fn save_review_comments(
@@ -3238,6 +3530,29 @@ mod persistence {
                 ))
             })
             .await
+        }
+
+        pub fn archived_review_comment_rounds(
+            &self,
+            workspace_id: WorkspaceId,
+            review_key: &str,
+        ) -> anyhow::Result<Vec<u64>> {
+            let sql_stmt = sql!(
+                SELECT DISTINCT archive_scope FROM project_diff_review_comments
+                WHERE workspace_id = ? AND review_key = ? AND session_id != "active" AND archived_on IS NOT NULL AND archive_scope LIKE "round:%"
+                ORDER BY archive_scope ASC
+            );
+            let rows = self.select_bound::<(WorkspaceId, String), String>(sql_stmt)?((
+                workspace_id,
+                review_key.to_string(),
+            ))?;
+            let mut rounds = rows
+                .into_iter()
+                .filter_map(|scope| scope.strip_prefix("round:")?.parse::<u64>().ok())
+                .collect::<Vec<_>>();
+            rounds.sort_unstable();
+            rounds.dedup();
+            Ok(rounds)
         }
 
         #[cfg(test)]
@@ -3584,7 +3899,9 @@ impl Render for BranchDiffToolbar {
             return div();
         };
         let focus_handle = project_diff.focus_handle(cx);
-        let review_count = project_diff.read(cx).total_review_comment_count();
+        let project_diff_state = project_diff.read(cx);
+        let review_count = project_diff_state.total_review_comment_count();
+        let copy_amp_prompt_in_progress = project_diff_state.copy_amp_prompt_in_progress;
         let (additions, deletions) = project_diff.read(cx).calculate_changed_lines(cx);
         let diff_base = project_diff.read(cx).diff_base(cx).clone();
         let DiffBase::Merge { base_ref } = diff_base else {
@@ -3628,7 +3945,7 @@ impl Render for BranchDiffToolbar {
                         &CopyAmpPromptForUnstampedReviewComments,
                         &focus_handle,
                     ))
-                    .disabled(review_count == 0)
+                    .disabled(review_count == 0 || copy_amp_prompt_in_progress)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.dispatch_action(&CopyAmpPromptForUnstampedReviewComments, window, cx);
                     })),
@@ -3803,6 +4120,44 @@ mod tests {
     }
 
     #[test]
+    fn test_partition_review_comments_json_by_round() {
+        let comments_json = serde_json::json!({
+            "schema_version": 1,
+            "comments": [
+                { "id": 0, "author": "vxio", "review_round": 1, "file": "a.txt", "side": "new", "hunk_line": 1, "line_start": 1, "line_end": 1, "body": "review one", "replies": [] },
+                { "id": 1, "author": "vxio", "review_round": 2, "file": "a.txt", "side": "new", "hunk_line": 2, "line_start": 2, "line_end": 2, "body": "review two", "replies": [] },
+                { "id": 2, "author": "vxio", "review_round": 1, "file": "a.txt", "side": "new", "hunk_line": 3, "line_start": 3, "line_end": 3, "body": "follow-up thread", "replies": [{ "id": 1000, "author": "vxio", "review_round": 2, "body": "review two follow-up" }] }
+            ]
+        })
+        .to_string();
+
+        let (archived_json, remaining_json, archived_count) =
+            partition_review_comments_json(&comments_json, ReviewCommentArchiveScope::Round(2))
+                .unwrap();
+        let archived: serde_json::Value = serde_json::from_str(&archived_json).unwrap();
+        let remaining: serde_json::Value = serde_json::from_str(&remaining_json).unwrap();
+
+        assert_eq!(archived_count, 2);
+        assert_eq!(archived["comments"][0]["body"], "review two");
+        assert_eq!(archived["comments"][1]["body"], "follow-up thread");
+        assert_eq!(remaining["comments"][0]["body"], "review one");
+    }
+
+    #[test]
+    fn test_review_comments_json_rounds_includes_replies() {
+        let comments_json = serde_json::json!({
+            "schema_version": 1,
+            "comments": [
+                { "id": 0, "author": "vxio", "review_round": 3, "file": "a.txt", "side": "new", "hunk_line": 1, "line_start": 1, "line_end": 1, "body": "three", "replies": [{ "id": 1000, "author": "vxio", "review_round": 2, "body": "two" }] },
+                { "id": 1, "author": "vxio", "review_round": 1, "file": "a.txt", "side": "new", "hunk_line": 2, "line_start": 2, "line_end": 2, "body": "one", "replies": [] }
+            ]
+        })
+        .to_string();
+
+        assert_eq!(review_comments_json_rounds(&comments_json), vec![1, 2, 3]);
+    }
+
+    #[test]
     fn test_remap_review_comment_paths_follows_renames() {
         let comments_json = serde_json::json!({
             "schema_version": 1,
@@ -3911,6 +4266,67 @@ mod tests {
         let visible = editor.read_with(cx, |editor, cx| editor.review_comments_json(cx).unwrap());
         assert!(!visible.contains("archive me"));
         assert!(visible.contains("keep me"));
+    }
+
+    #[gpui::test]
+    async fn test_copy_amp_prompt_action_reports_in_progress_without_reentrant_workspace_update(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "foo.txt": "FOO\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        workspace.update(cx, |workspace, _| workspace.set_random_database_id());
+        let diff = cx.new_window_entity(|window, cx| {
+            let Some(repository) = project.read(cx).active_repository(cx) else {
+                panic!("expected active repository");
+            };
+            let branch_diff = cx.new(|cx| {
+                let mut branch_diff = branch_diff::BranchDiff::new(
+                    DiffBase::Merge {
+                        base_ref: "origin/main".into(),
+                    },
+                    project.clone(),
+                    window,
+                    cx,
+                );
+                branch_diff.set_repo(Some(repository), cx);
+                branch_diff
+            });
+            ProjectDiff::new_impl(
+                branch_diff,
+                project.clone(),
+                workspace.clone(),
+                true,
+                window,
+                cx,
+            )
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(diff.clone()), None, true, window, cx);
+        });
+        diff.update(cx, |diff, cx| {
+            diff.copy_amp_prompt_in_progress = true;
+            cx.notify();
+        });
+
+        cx.update(|window, cx| {
+            window.dispatch_action(CopyAmpPromptForUnstampedReviewComments.boxed_clone(), cx);
+        });
+        cx.run_until_parked();
+
+        assert!(diff.read_with(cx, |diff, _| diff.copy_amp_prompt_in_progress));
     }
 
     #[gpui::test]
@@ -6042,14 +6458,108 @@ mod tests {
             .await
             .unwrap();
 
-        diff.update(cx, |diff, cx| {
-            diff.refresh_branch_diff(Some("origin/dev".into()), cx);
+        fs.with_git_state(path!("/project/.git").as_ref(), true, |state| {
+            state.default_branch = Some("origin/dev".into());
+        })
+        .unwrap();
+        cx.update(|window, cx| {
+            diff.update(cx, |diff, cx| {
+                diff.refresh_diff(window, cx);
+            });
         });
+        cx.run_until_parked();
 
         diff.read_with(cx, |diff, cx| match diff.diff_base(cx) {
             DiffBase::Merge { base_ref } => assert_eq!(base_ref.as_ref(), "origin/dev"),
             DiffBase::Head => panic!("expected branch diff"),
         });
+    }
+
+    #[gpui::test]
+    async fn test_refresh_explicit_branch_diff_keeps_base_ref(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "changed",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx
+            .update(|window, cx| {
+                let Some(repository) = project.read(cx).active_repository(cx) else {
+                    return Task::ready(Err(anyhow!("No active repository")));
+                };
+                ProjectDiff::new_with_branch_base(
+                    project.clone(),
+                    workspace,
+                    "origin/main".into(),
+                    repository,
+                    false,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        fs.with_git_state(path!("/project/.git").as_ref(), true, |state| {
+            state.default_branch = Some("origin/dev".into());
+        })
+        .unwrap();
+        cx.update(|window, cx| {
+            diff.update(cx, |diff, cx| {
+                diff.refresh_diff(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        diff.read_with(cx, |diff, cx| match diff.diff_base(cx) {
+            DiffBase::Merge { base_ref } => assert_eq!(base_ref.as_ref(), "origin/main"),
+            DiffBase::Head => panic!("expected branch diff"),
+        });
+    }
+
+    #[gpui::test]
+    async fn test_project_diff_persistence_keeps_default_branch_tracking(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ ".git": {} }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        workspace.update(cx, |workspace, _| workspace.set_random_database_id());
+
+        let (db, workspace_id) = cx.update(|_, cx| {
+            (
+                persistence::ProjectDiffDb::global(cx),
+                workspace.read(cx).database_id().unwrap(),
+            )
+        });
+        let item_id = 1;
+        let diff_base = DiffBase::Merge {
+            base_ref: "origin/main".into(),
+        };
+
+        db.insert_test_workspace(workspace_id).await.unwrap();
+        db.save_diff_base(item_id, workspace_id, diff_base.clone(), true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.get_diff_base(item_id, workspace_id).unwrap(),
+            (diff_base, true)
+        );
     }
 
     #[gpui::test]
