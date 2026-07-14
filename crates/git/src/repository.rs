@@ -3256,22 +3256,22 @@ impl GitRepository for RealGitRepository {
                     .filter_map(|line| line.split_once('\t'))
                     .collect();
 
-                if let Some(target) = refs.get("refs/remotes/upstream/HEAD") {
+                if let Some(target) = refs.get("refs/remotes/origin/HEAD") {
                     let strip_prefix = if include_remote_name {
                         "refs/remotes/"
                     } else {
-                        "refs/remotes/upstream/"
+                        "refs/remotes/origin/"
                     };
                     if let Some(branch) = target.strip_prefix(strip_prefix) {
                         return Ok(Some(branch.into()));
                     }
                 }
 
-                if let Some(target) = refs.get("refs/remotes/origin/HEAD") {
+                if let Some(target) = refs.get("refs/remotes/upstream/HEAD") {
                     let strip_prefix = if include_remote_name {
                         "refs/remotes/"
                     } else {
-                        "refs/remotes/origin/"
+                        "refs/remotes/upstream/"
                     };
                     if let Some(branch) = target.strip_prefix(strip_prefix) {
                         return Ok(Some(branch.into()));
@@ -6654,6 +6654,36 @@ mod tests {
         assert_eq!(
             repo.default_branch(true).await.unwrap(),
             Some("origin/main".into())
+        );
+
+        git_command(
+            repo_dir.path(),
+            ["update-ref", "refs/remotes/origin/dev", "HEAD"],
+        );
+        git_command(
+            repo_dir.path(),
+            [
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/dev",
+            ],
+        );
+        git_command(
+            repo_dir.path(),
+            ["update-ref", "refs/remotes/upstream/main", "HEAD"],
+        );
+        git_command(
+            repo_dir.path(),
+            [
+                "symbolic-ref",
+                "refs/remotes/upstream/HEAD",
+                "refs/remotes/upstream/main",
+            ],
+        );
+
+        assert_eq!(
+            repo.default_branch(true).await.unwrap(),
+            Some("origin/dev".into())
         );
     }
 

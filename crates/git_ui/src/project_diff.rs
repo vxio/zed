@@ -3271,6 +3271,11 @@ mod persistence {
                 UPDATE project_diffs SET follows_default_branch = TRUE WHERE diff_base LIKE "%Merge%";
             ),
             sql!(UPDATE project_diffs SET follows_default_branch = FALSE;),
+            sql!(
+                UPDATE project_diffs SET follows_default_branch = TRUE
+                WHERE diff_base LIKE "%origin/main%"
+                   OR diff_base LIKE "%upstream/main%";
+            ),
         ];
     }
 
