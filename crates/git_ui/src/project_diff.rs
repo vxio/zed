@@ -41,7 +41,6 @@ use settings::{
 };
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use theme::ActiveTheme;
@@ -163,7 +162,7 @@ enum RestoreLatestReviewCommentsResult {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CopyAmpPromptResult {
-    Started,
+    Copied,
     AlreadyInProgress,
     Unavailable,
 }
@@ -493,12 +492,13 @@ impl ProjectDiff {
             project_diff.copy_amp_prompt_for_unstamped_review_comments(workspace_id, window, cx)
         });
         match result {
-            CopyAmpPromptResult::Started => {
+            CopyAmpPromptResult::Copied => {
                 workspace.show_toast(
                     Toast::new(
                         copy_amp_prompt_notification_id(),
-                        "Generating Amp prompt for unstamped review comments…",
-                    ),
+                        "Copied Amp prompt to clipboard.",
+                    )
+                    .autohide(),
                     cx,
                 );
             }
@@ -983,6 +983,28 @@ impl ProjectDiff {
             return CopyAmpPromptResult::AlreadyInProgress;
         }
 
+        let Ok((comments_json, prompt)) = generate_amp_prompt_for_unstamped_review_comments(
+            repo,
+            review_key.clone(),
+            comments_json,
+        ) else {
+            return CopyAmpPromptResult::Unavailable;
+        };
+
+        cx.write_to_clipboard(ClipboardItem::new_string(prompt));
+        self.loaded_review_comments_json = Some(comments_json.clone());
+        self.restoring_review_comments = true;
+        self.editor.update(cx, |editor, cx| {
+            let editor = editor.rhs_editor();
+            editor.update(cx, |editor, cx| {
+                if let Err(error) = editor.restore_review_comments_json(&comments_json, window, cx)
+                {
+                    log::error!("failed to restore stamped review comments: {error:#}");
+                }
+            });
+        });
+        self.restoring_review_comments = false;
+
         self.copy_amp_prompt_in_progress = true;
         cx.notify();
 
@@ -993,26 +1015,9 @@ impl ProjectDiff {
         window
             .spawn(cx, async move |cx| {
                 let result = async {
-                    db.save_review_comments(workspace_id, review_key.clone(), comments_json)
+                    db.save_review_comments(workspace_id, review_key, comments_json)
                         .await
-                        .context("saving review comments before generating Amp prompt")?;
-                    let prompt = cx
-                        .background_spawn(async move {
-                            generate_amp_prompt_for_unstamped_review_comments(repo, review_key)
-                        })
-                        .await?;
-
-                    workspace.update(cx, |workspace, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(prompt));
-                        workspace.show_toast(
-                            Toast::new(
-                                copy_amp_prompt_notification_id(),
-                                "Copied Amp prompt to clipboard.",
-                            )
-                            .autohide(),
-                            cx,
-                        );
-                    })?;
+                        .context("saving stamped review comments after copying Amp prompt")?;
                     anyhow::Ok(())
                 }
                 .await;
@@ -1028,7 +1033,7 @@ impl ProjectDiff {
                         workspace.show_toast(
                             Toast::new(
                                 copy_amp_prompt_notification_id(),
-                                "Failed to copy Amp prompt.",
+                                "Copied Amp prompt, but failed to save stamped review comments.",
                             )
                             .autohide(),
                             cx,
@@ -1040,7 +1045,7 @@ impl ProjectDiff {
             })
             .detach_and_notify_err(error_workspace, window, cx);
 
-        CopyAmpPromptResult::Started
+        CopyAmpPromptResult::Copied
     }
 
     fn archive_review_comments(
@@ -2125,32 +2130,223 @@ impl ProjectDiff {
 fn generate_amp_prompt_for_unstamped_review_comments(
     repo: String,
     review_key: String,
-) -> Result<String> {
-    let home = std::env::var_os("HOME").context("$HOME is not set")?;
-    let script_path = std::path::PathBuf::from(home).join(".config/scripts/zed-review");
-    let output = Command::new(&script_path)
-        .arg("--repo")
-        .arg(&repo)
-        .arg("prompt")
-        .arg("--review-key")
-        .arg(&review_key)
-        .arg("--author")
-        .arg("vxio")
-        .arg("--round")
-        .arg("new")
-        .arg("--stamp")
-        .current_dir(&repo)
-        .output()
-        .with_context(|| format!("running {}", script_path.display()))?;
+    comments_json: String,
+) -> Result<(String, String)> {
+    let mut snapshot: serde_json::Value =
+        serde_json::from_str(&comments_json).context("deserializing review comments")?;
+    let schema_version = snapshot
+        .get("schema_version")
+        .and_then(|version| version.as_u64())
+        .unwrap_or(1);
+    let comments = snapshot
+        .get_mut("comments")
+        .and_then(|comments| comments.as_array_mut())
+        .context("review comments JSON is missing comments array")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let message = if stderr.is_empty() { stdout } else { stderr };
-        return Err(anyhow!("zed-review prompt failed: {message}"));
+    let current_round = review_comments_current_round(comments.iter());
+    let next_round = current_round + 1;
+    let mut stamped_any = false;
+    for comment in comments.iter_mut() {
+        if review_item_is_unstamped_by(comment, "vxio", "vxio") {
+            comment["review_round"] = serde_json::json!(next_round);
+            stamped_any = true;
+        }
+        if let Some(replies) = comment
+            .get_mut("replies")
+            .and_then(|replies| replies.as_array_mut())
+        {
+            for reply in replies {
+                if review_item_is_unstamped_by(reply, "amp", "vxio") {
+                    reply["review_round"] = serde_json::json!(next_round);
+                    stamped_any = true;
+                }
+            }
+        }
+    }
+    if !stamped_any {
+        return Err(anyhow!("No unstamped review comments found"));
     }
 
-    String::from_utf8(output.stdout).context("zed-review prompt returned invalid UTF-8")
+    let queue_comments = comments
+        .iter()
+        .filter(|comment| review_item_author(comment, "vxio") == "vxio")
+        .filter(|comment| review_comment_contains_round(comment, next_round))
+        .map(compact_review_comment_for_prompt)
+        .collect::<Vec<_>>();
+    if queue_comments.is_empty() {
+        return Err(anyhow!("No unstamped review comments found"));
+    }
+
+    let view = review_key_view_label(&repo, &review_key);
+    let branch = review_key_branch(&review_key);
+    let compact_packet = serde_json::json!({
+        "repo": repo,
+        "diff_base": review_key.strip_prefix(&format!("{repo}\n")).unwrap_or(&review_key),
+        "view": view,
+        "count": queue_comments.len(),
+        "comments": queue_comments,
+    });
+    let prompt = [
+        format!(
+            "Address my newest Zed Git diff review comments for this repo — these are now Review #{next_round}."
+        ),
+        "".to_string(),
+        format!(
+            "These comments are for the repo/worktree at `{repo}`{}. Make all code edits in that exact directory — not in another repo or sibling worktree — and run any verification from there.",
+            branch
+                .as_ref()
+                .map(|branch| format!(" (branch `{branch}`)"))
+                .unwrap_or_default()
+        ),
+        "".to_string(),
+        format!(
+            "They live in the \"{view}\" diff view. Pass this exact repo path AND the reviewKey below (copy the reviewKey verbatim, including the line breaks) to every zed_review_* tool call so you read and reply on the right repo and view:"
+        ),
+        "```".to_string(),
+        review_key.clone(),
+        "```".to_string(),
+        "".to_string(),
+        format!(
+            "Each comment/reply below carries a `review` round number. The threads are shown in full for context, but only act on the items whose `review` number is {next_round}. Treat every other item in each thread as settled context; do not redo it. Make the smallest correct code changes. If an item is a question or is not actionable, answer it in chat instead of inventing a change. After editing, run the narrowest useful verification."
+        ),
+        "".to_string(),
+        format!(
+            "Before changing code, load the `addressing-zed-review-comments` skill and follow it for marker capture, reply posting, reply verification, workflow-evolution, and refresh behavior. If you need to refresh the queue, call `zed_review_comments_list` with author `vxio`, the repo path and reviewKey above, and round `{next_round}` so you stay scoped to this round."
+        ),
+        "".to_string(),
+        serde_json::to_string(&compact_packet).context("serializing Amp prompt packet")?,
+    ]
+    .join("\n");
+
+    let stamped_json = serde_json::json!({
+        "schema_version": schema_version,
+        "comments": comments,
+    })
+    .to_string();
+    Ok((stamped_json, prompt))
+}
+
+fn review_item_author<'a>(item: &'a serde_json::Value, default_author: &'a str) -> &'a str {
+    item.get("author")
+        .and_then(|author| author.as_str())
+        .unwrap_or(default_author)
+}
+
+fn review_item_is_unstamped_by(
+    item: &serde_json::Value,
+    default_author: &str,
+    wanted_author: &str,
+) -> bool {
+    item.get("deleted_on").is_none()
+        && review_item_author(item, default_author) == wanted_author
+        && item.get("review_round").is_none()
+}
+
+fn review_comments_current_round<'a>(comments: impl Iterator<Item = &'a serde_json::Value>) -> u64 {
+    comments
+        .flat_map(|comment| {
+            std::iter::once(comment).chain(
+                comment
+                    .get("replies")
+                    .and_then(|replies| replies.as_array())
+                    .into_iter()
+                    .flatten(),
+            )
+        })
+        .filter_map(comment_review_round)
+        .max()
+        .unwrap_or(0)
+}
+
+fn compact_review_comment_for_prompt(comment: &serde_json::Value) -> serde_json::Value {
+    let mut compact = serde_json::Map::new();
+    compact.insert("id".to_string(), comment["id"].clone());
+    compact.insert(
+        "by".to_string(),
+        serde_json::Value::String(review_item_author(comment, "vxio").to_string()),
+    );
+    compact.insert("path".to_string(), comment["file"].clone());
+    compact.insert("line".to_string(), comment["line_start"].clone());
+    compact.insert("body".to_string(), comment["body"].clone());
+    if let Some(created_at) = comment.get("created_at") {
+        compact.insert("at".to_string(), created_at.clone());
+    }
+    if let Some(round) = comment_review_round(comment) {
+        compact.insert("review".to_string(), serde_json::json!(round));
+    }
+    if comment.get("line_end") != comment.get("line_start") {
+        compact.insert("end_line".to_string(), comment["line_end"].clone());
+    }
+    if comment
+        .get("agent_feedback")
+        .or_else(|| comment.get("agent_toolbox"))
+        .and_then(|value| value.as_bool())
+        == Some(true)
+    {
+        compact.insert("agent_feedback".to_string(), serde_json::Value::Bool(true));
+    }
+    let replies = comment
+        .get("replies")
+        .and_then(|replies| replies.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|reply| reply.get("deleted_on").is_none())
+        .map(|reply| {
+            let mut compact_reply = serde_json::Map::new();
+            compact_reply.insert("id".to_string(), reply["id"].clone());
+            compact_reply.insert(
+                "by".to_string(),
+                serde_json::Value::String(review_item_author(reply, "amp").to_string()),
+            );
+            if let Some(created_at) = reply.get("created_at") {
+                compact_reply.insert("at".to_string(), created_at.clone());
+            }
+            if let Some(round) = comment_review_round(reply) {
+                compact_reply.insert("review".to_string(), serde_json::json!(round));
+            }
+            compact_reply.insert("body".to_string(), reply["body"].clone());
+            if reply
+                .get("agent_feedback")
+                .or_else(|| reply.get("agent_toolbox"))
+                .and_then(|value| value.as_bool())
+                == Some(true)
+            {
+                compact_reply.insert("agent_feedback".to_string(), serde_json::Value::Bool(true));
+            }
+            serde_json::Value::Object(compact_reply)
+        })
+        .collect::<Vec<_>>();
+    if !replies.is_empty() {
+        compact.insert("replies".to_string(), serde_json::Value::Array(replies));
+    }
+
+    serde_json::Value::Object(compact)
+}
+
+fn review_key_view_label(repo: &str, review_key: &str) -> String {
+    let suffix = review_key
+        .strip_prefix(&format!("{repo}\n"))
+        .unwrap_or(review_key);
+    let Some((_ref, view)) = suffix.split_once('\n') else {
+        return "Branch comments".to_string();
+    };
+    if view == "uncommitted" {
+        "Uncommitted Changes".to_string()
+    } else if let Some(base) = view.strip_prefix("since:") {
+        format!("Changes since {base}")
+    } else {
+        view.to_string()
+    }
+}
+
+fn review_key_branch(review_key: &str) -> Option<String> {
+    let ref_line = review_key
+        .lines()
+        .nth(1)
+        .or_else(|| review_key.lines().next())?;
+    ref_line
+        .strip_prefix("branch:refs/heads/")
+        .map(ToOwned::to_owned)
 }
 
 const CONFLICT_SORT_PREFIX: u64 = 1;
@@ -4164,6 +4360,31 @@ mod tests {
         .to_string();
 
         assert_eq!(review_comments_json_rounds(&comments_json), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_generate_amp_prompt_for_unstamped_review_comments_stamps_in_memory_json() {
+        let repo = "/project".to_string();
+        let review_key = "/project\nbranch:refs/heads/topic\nsince:origin/main".to_string();
+        let comments_json = serde_json::json!({
+            "schema_version": 1,
+            "comments": [
+                { "id": 0, "author": "vxio", "file": "a.txt", "side": "new", "hunk_line": 1, "line_start": 1, "line_end": 1, "body": "do this", "replies": [] },
+                { "id": 1, "author": "vxio", "review_round": 1, "file": "b.txt", "side": "new", "hunk_line": 2, "line_start": 2, "line_end": 2, "body": "old", "replies": [] }
+            ]
+        })
+        .to_string();
+
+        let (stamped_json, prompt) =
+            generate_amp_prompt_for_unstamped_review_comments(repo, review_key, comments_json)
+                .unwrap();
+        let stamped: serde_json::Value = serde_json::from_str(&stamped_json).unwrap();
+
+        assert_eq!(stamped["comments"][0]["review_round"], 2);
+        assert_eq!(stamped["comments"][1]["review_round"], 1);
+        assert!(prompt.contains("Review #2"));
+        assert!(prompt.contains("do this"));
+        assert!(!prompt.contains("\"body\":\"old\""));
     }
 
     #[test]
