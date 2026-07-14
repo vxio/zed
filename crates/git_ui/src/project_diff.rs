@@ -3266,7 +3266,11 @@ mod persistence {
                 DROP TABLE project_diff_review_comments;
                 ALTER TABLE project_diff_review_comments_v2 RENAME TO project_diff_review_comments;
             ),
-            sql!(ALTER TABLE project_diffs ADD COLUMN follows_default_branch INTEGER DEFAULT 0;),
+            sql!(
+                ALTER TABLE project_diffs ADD COLUMN follows_default_branch INTEGER DEFAULT 0;
+                UPDATE project_diffs SET follows_default_branch = TRUE WHERE diff_base LIKE "%Merge%";
+            ),
+            sql!(UPDATE project_diffs SET follows_default_branch = FALSE;),
         ];
     }
 
