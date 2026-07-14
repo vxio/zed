@@ -164,7 +164,7 @@ enum RestoreLatestReviewCommentsResult {
 enum CopyAmpPromptResult {
     Copied,
     AlreadyInProgress,
-    Unavailable,
+    Failed(&'static str),
 }
 
 fn restore_latest_review_comments_notification_id() -> NotificationId {
@@ -483,6 +483,11 @@ impl ProjectDiff {
         cx: &mut Context<Workspace>,
     ) {
         let Some(workspace_id) = workspace.database_id() else {
+            Self::show_copy_amp_prompt_result(
+                workspace,
+                CopyAmpPromptResult::Failed("This workspace cannot save review comments."),
+                cx,
+            );
             return;
         };
         let Some(project_diff) = workspace.active_item_as::<ProjectDiff>(cx) else {
@@ -491,6 +496,15 @@ impl ProjectDiff {
         let result = project_diff.update(cx, |project_diff, cx| {
             project_diff.copy_amp_prompt_for_unstamped_review_comments(workspace_id, window, cx)
         });
+
+        Self::show_copy_amp_prompt_result(workspace, result, cx);
+    }
+
+    fn show_copy_amp_prompt_result(
+        workspace: &mut Workspace,
+        result: CopyAmpPromptResult,
+        cx: &mut Context<Workspace>,
+    ) {
         match result {
             CopyAmpPromptResult::Copied => {
                 workspace.show_toast(
@@ -511,7 +525,12 @@ impl ProjectDiff {
                     cx,
                 );
             }
-            CopyAmpPromptResult::Unavailable => {}
+            CopyAmpPromptResult::Failed(message) => {
+                workspace.show_toast(
+                    Toast::new(copy_amp_prompt_notification_id(), message).autohide(),
+                    cx,
+                );
+            }
         }
     }
 
@@ -959,7 +978,7 @@ impl ProjectDiff {
         cx: &mut Context<Self>,
     ) -> CopyAmpPromptResult {
         let Some(review_key) = self.review_comments_key(cx) else {
-            return CopyAmpPromptResult::Unavailable;
+            return CopyAmpPromptResult::Failed("No review view is available to copy.");
         };
         let Some(repo) = review_key
             .lines()
@@ -967,7 +986,7 @@ impl ProjectDiff {
             .filter(|repo| !repo.is_empty())
             .map(ToOwned::to_owned)
         else {
-            return CopyAmpPromptResult::Unavailable;
+            return CopyAmpPromptResult::Failed("No repository is available to copy a prompt for.");
         };
         let Ok(comments_json) = self
             .editor
@@ -976,7 +995,7 @@ impl ProjectDiff {
             .read(cx)
             .review_comments_json(cx)
         else {
-            return CopyAmpPromptResult::Unavailable;
+            return CopyAmpPromptResult::Failed("Failed to read the current review comments.");
         };
 
         if self.copy_amp_prompt_in_progress {
@@ -988,7 +1007,9 @@ impl ProjectDiff {
             review_key.clone(),
             comments_json,
         ) else {
-            return CopyAmpPromptResult::Unavailable;
+            return CopyAmpPromptResult::Failed(
+                "No unstamped review comments are available to copy.",
+            );
         };
 
         cx.write_to_clipboard(ClipboardItem::new_string(prompt));
@@ -4067,6 +4088,31 @@ impl BranchDiffToolbar {
             cx.dispatch_action(action.as_ref());
         })
     }
+
+    fn copy_amp_prompt(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project_diff) = self.project_diff(cx) else {
+            return;
+        };
+        let Some(workspace) = project_diff.read(cx).workspace.upgrade() else {
+            return;
+        };
+        let Some(workspace_id) = workspace.read(cx).database_id() else {
+            workspace.update(cx, |workspace, cx| {
+                ProjectDiff::show_copy_amp_prompt_result(
+                    workspace,
+                    CopyAmpPromptResult::Failed("This workspace cannot save review comments."),
+                    cx,
+                );
+            });
+            return;
+        };
+        let result = project_diff.update(cx, |project_diff, cx| {
+            project_diff.copy_amp_prompt_for_unstamped_review_comments(workspace_id, window, cx)
+        });
+        workspace.update(cx, |workspace, cx| {
+            ProjectDiff::show_copy_amp_prompt_result(workspace, result, cx);
+        });
+    }
 }
 
 impl EventEmitter<ToolbarItemEvent> for BranchDiffToolbar {}
@@ -4152,7 +4198,7 @@ impl Render for BranchDiffToolbar {
                     ))
                     .disabled(review_count == 0 || copy_amp_prompt_in_progress)
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.dispatch_action(&CopyAmpPromptForUnstampedReviewComments, window, cx);
+                        this.copy_amp_prompt(window, cx);
                     })),
             )
             .child(
@@ -4499,9 +4545,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_copy_amp_prompt_action_reports_in_progress_without_reentrant_workspace_update(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_copy_amp_prompt_from_toolbar_copies_on_first_click(cx: &mut TestAppContext) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -4546,17 +4590,70 @@ mod tests {
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.add_item_to_active_pane(Box::new(diff.clone()), None, true, window, cx);
         });
-        diff.update(cx, |diff, cx| {
-            diff.copy_amp_prompt_in_progress = true;
-            cx.notify();
+        let workspace_id = workspace.read_with(cx, |workspace, _| workspace.database_id().unwrap());
+        cx.update(|_, cx| persistence::ProjectDiffDb::global(cx))
+            .insert_test_workspace(workspace_id)
+            .await
+            .unwrap();
+        let comments_json = serde_json::json!({
+            "schema_version": 1,
+            "comments": [
+                { "id": 0, "author": "vxio", "file": "foo.txt", "side": "new", "hunk_line": 1, "line_start": 1, "line_end": 1, "body": "first click", "replies": [] }
+            ]
+        })
+        .to_string();
+        diff.update_in(cx, |diff, window, cx| {
+            let editor = diff.editor.read(cx).rhs_editor().clone();
+            editor.update(cx, |editor, cx| {
+                editor
+                    .restore_review_comments_json(&comments_json, window, cx)
+                    .unwrap();
+            });
         });
 
+        let toolbar = cx.new(|cx| {
+            let mut toolbar = BranchDiffToolbar::new(cx);
+            toolbar.project_diff = Some(diff.downgrade());
+            toolbar
+        });
+        toolbar.update_in(cx, |toolbar, window, cx| {
+            toolbar.copy_amp_prompt(window, cx);
+        });
+        cx.run_until_parked();
+
+        let clipboard = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap();
+        assert!(clipboard.contains("first click"));
+
+        let comments_json = serde_json::json!({
+            "schema_version": 1,
+            "comments": [
+                { "id": 0, "author": "vxio", "review_round": 1, "file": "foo.txt", "side": "new", "hunk_line": 1, "line_start": 1, "line_end": 1, "body": "first click", "replies": [] },
+                { "id": 1, "author": "vxio", "file": "foo.txt", "side": "new", "hunk_line": 1, "line_start": 1, "line_end": 1, "body": "command action", "replies": [] }
+            ]
+        })
+        .to_string();
+        diff.update_in(cx, |diff, window, cx| {
+            let editor = diff.editor.read(cx).rhs_editor().clone();
+            editor.update(cx, |editor, cx| {
+                editor
+                    .restore_review_comments_json(&comments_json, window, cx)
+                    .unwrap();
+            });
+        });
+        cx.focus(&workspace);
         cx.update(|window, cx| {
             window.dispatch_action(CopyAmpPromptForUnstampedReviewComments.boxed_clone(), cx);
         });
         cx.run_until_parked();
 
-        assert!(diff.read_with(cx, |diff, _| diff.copy_amp_prompt_in_progress));
+        let clipboard = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap();
+        assert!(clipboard.contains("command action"));
     }
 
     #[gpui::test]
