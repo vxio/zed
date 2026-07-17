@@ -373,7 +373,13 @@ pub struct OrphanedReviewCommentSummary {
     pub line_end: u32,
     pub body: String,
     pub outdated_reason: Option<String>,
-    pub reply_count: usize,
+    pub replies: Vec<OrphanedReviewReplySummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrphanedReviewReplySummary {
+    pub author: String,
+    pub body: String,
 }
 
 #[derive(Clone)]
@@ -3739,7 +3745,14 @@ impl Editor {
                 line_end: comment.line_end,
                 body: comment.body.clone(),
                 outdated_reason: comment.outdated_reason.clone(),
-                reply_count: comment.replies.len(),
+                replies: comment
+                    .replies
+                    .iter()
+                    .map(|reply| OrphanedReviewReplySummary {
+                        author: reply.author.clone(),
+                        body: reply.body.clone(),
+                    })
+                    .collect(),
             })
             .collect()
     }

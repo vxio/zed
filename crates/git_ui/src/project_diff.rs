@@ -3285,7 +3285,7 @@ impl ProjectDiff {
                         Some("line_not_in_diff") => "line no longer has a visible diff",
                         _ => "change no longer has a visible diff",
                     };
-                    let reply_label = match comment.reply_count {
+                    let reply_label = match comment.replies.len() {
                         0 => None,
                         1 => Some("1 reply".to_string()),
                         count => Some(format!("{count} replies")),
@@ -3325,6 +3325,18 @@ impl ProjectDiff {
                                 }),
                         )
                         .child(Label::new(comment.body).size(LabelSize::Small))
+                        .children(comment.replies.into_iter().map(|reply| {
+                            v_flex()
+                                .ml_4()
+                                .min_w_0()
+                                .gap_0p5()
+                                .child(
+                                    Label::new(reply.author)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(Label::new(reply.body).size(LabelSize::Small))
+                        }))
                 })))
             })
             .into_any_element()
@@ -4068,15 +4080,30 @@ fn render_send_review_to_agent_button(review_count: usize, focus_handle: &FocusH
 
 pub struct BranchDiffToolbar {
     project_diff: Option<WeakEntity<ProjectDiff>>,
+    _project_diff_subscription: Option<Subscription>,
 }
 
 impl BranchDiffToolbar {
     pub fn new(_cx: &mut Context<Self>) -> Self {
-        Self { project_diff: None }
+        Self {
+            project_diff: None,
+            _project_diff_subscription: None,
+        }
     }
 
     fn project_diff(&self, _: &App) -> Option<Entity<ProjectDiff>> {
         self.project_diff.as_ref()?.upgrade()
+    }
+
+    fn set_project_diff(
+        &mut self,
+        project_diff: Option<Entity<ProjectDiff>>,
+        cx: &mut Context<Self>,
+    ) {
+        self._project_diff_subscription = project_diff
+            .as_ref()
+            .map(|project_diff| cx.observe(project_diff, |_, _, cx| cx.notify()));
+        self.project_diff = project_diff.map(|project_diff| project_diff.downgrade());
     }
 
     fn dispatch_action(&self, action: &dyn Action, window: &mut Window, cx: &mut Context<Self>) {
@@ -4124,10 +4151,10 @@ impl ToolbarItemView for BranchDiffToolbar {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> ToolbarItemLocation {
-        self.project_diff = active_pane_item
+        let project_diff = active_pane_item
             .and_then(|item| item.act_as::<ProjectDiff>(cx))
-            .filter(|item| matches!(item.read(cx).diff_base(cx), DiffBase::Merge { .. }))
-            .map(|entity| entity.downgrade());
+            .filter(|item| matches!(item.read(cx).diff_base(cx), DiffBase::Merge { .. }));
+        self.set_project_diff(project_diff, cx);
         if self.project_diff.is_some() {
             ToolbarItemLocation::PrimaryRight
         } else {
@@ -4153,6 +4180,7 @@ impl Render for BranchDiffToolbar {
         let project_diff_state = project_diff.read(cx);
         let review_count = project_diff_state.total_review_comment_count();
         let copy_amp_prompt_in_progress = project_diff_state.copy_amp_prompt_in_progress;
+        let copy_amp_prompt_disabled = review_count == 0 || copy_amp_prompt_in_progress;
         let (additions, deletions) = project_diff.read(cx).calculate_changed_lines(cx);
         let diff_base = project_diff.read(cx).diff_base(cx).clone();
         let DiffBase::Merge { base_ref } = diff_base else {
@@ -4189,17 +4217,30 @@ impl Render for BranchDiffToolbar {
                     })),
             )
             .child(
-                IconButton::new("copy-amp-prompt", IconName::ToolCopy)
-                    .shape(ui::IconButtonShape::Square)
-                    .tooltip(Tooltip::for_action_title_in(
-                        "Copy Amp Prompt for Unstamped Review Comments",
-                        &CopyAmpPromptForUnstampedReviewComments,
-                        &focus_handle,
-                    ))
-                    .disabled(review_count == 0 || copy_amp_prompt_in_progress)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.copy_amp_prompt(window, cx);
-                    })),
+                div()
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, _: &gpui::MouseDownEvent, window, cx| {
+                            if !copy_amp_prompt_disabled {
+                                this.copy_amp_prompt(window, cx);
+                            }
+                        }),
+                    )
+                    .child(
+                        IconButton::new("copy-amp-prompt", IconName::ToolCopy)
+                            .shape(ui::IconButtonShape::Square)
+                            .tooltip(Tooltip::for_action_title_in(
+                                "Copy Amp Prompt for Unstamped Review Comments",
+                                &CopyAmpPromptForUnstampedReviewComments,
+                                &focus_handle,
+                            ))
+                            .disabled(copy_amp_prompt_disabled)
+                            .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
+                                if matches!(event, gpui::ClickEvent::Keyboard(_)) {
+                                    this.copy_amp_prompt(window, cx);
+                                }
+                            })),
+                    ),
             )
             .child(
                 PopoverMenu::new("branch-diff-base-branch-picker")
@@ -4317,7 +4358,7 @@ mod tests {
     use project::FakeFs;
     use serde_json::json;
     use settings::{DiffViewStyle, GitPanelGroupBy, GitPanelSortBy, SettingsStore};
-    use std::path::Path;
+    use std::{cell::Cell, path::Path, rc::Rc};
     use unindent::Unindent as _;
     use util::{
         path,
@@ -4545,7 +4586,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_copy_amp_prompt_from_toolbar_copies_on_first_click(cx: &mut TestAppContext) {
+    async fn test_copy_amp_prompt_toolbar_updates_when_review_comments_change(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -4595,6 +4638,16 @@ mod tests {
             .insert_test_workspace(workspace_id)
             .await
             .unwrap();
+        let toolbar = cx.replace_root_view(|_, cx| {
+            let mut toolbar = BranchDiffToolbar::new(cx);
+            toolbar.set_project_diff(Some(diff.clone()), cx);
+            toolbar
+        });
+        let toolbar_notified = Rc::new(Cell::new(false));
+        let _toolbar_subscription = cx.update(|_, cx| {
+            let toolbar_notified = toolbar_notified.clone();
+            cx.observe(&toolbar, move |_, _| toolbar_notified.set(true))
+        });
         let comments_json = serde_json::json!({
             "schema_version": 1,
             "comments": [
@@ -4610,50 +4663,40 @@ mod tests {
                     .unwrap();
             });
         });
+        assert!(toolbar_notified.get());
 
-        let toolbar = cx.new(|cx| {
-            let mut toolbar = BranchDiffToolbar::new(cx);
-            toolbar.project_diff = Some(diff.downgrade());
-            toolbar
+        let button_bounds = cx
+            .debug_bounds("ICON-ToolCopy")
+            .expect("Copy Amp Prompt button should be visible");
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: button_bounds.center(),
+            modifiers: gpui::Modifiers::none(),
+            button: gpui::MouseButton::Left,
+            click_count: 1,
+            first_mouse: false,
         });
-        toolbar.update_in(cx, |toolbar, window, cx| {
-            toolbar.copy_amp_prompt(window, cx);
-        });
-        cx.run_until_parked();
 
         let clipboard = cx
             .read_from_clipboard()
             .and_then(|item| item.text())
             .unwrap();
         assert!(clipboard.contains("first click"));
-
-        let comments_json = serde_json::json!({
-            "schema_version": 1,
-            "comments": [
-                { "id": 0, "author": "vxio", "review_round": 1, "file": "foo.txt", "side": "new", "hunk_line": 1, "line_start": 1, "line_end": 1, "body": "first click", "replies": [] },
-                { "id": 1, "author": "vxio", "file": "foo.txt", "side": "new", "hunk_line": 1, "line_start": 1, "line_end": 1, "body": "command action", "replies": [] }
-            ]
-        })
-        .to_string();
-        diff.update_in(cx, |diff, window, cx| {
-            let editor = diff.editor.read(cx).rhs_editor().clone();
-            editor.update(cx, |editor, cx| {
-                editor
-                    .restore_review_comments_json(&comments_json, window, cx)
-                    .unwrap();
-            });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: button_bounds.center(),
+            modifiers: gpui::Modifiers::none(),
+            button: gpui::MouseButton::Left,
+            click_count: 1,
         });
-        cx.focus(&workspace);
-        cx.update(|window, cx| {
-            window.dispatch_action(CopyAmpPromptForUnstampedReviewComments.boxed_clone(), cx);
+        let stamped = diff.read_with(cx, |diff, cx| {
+            diff.editor
+                .read(cx)
+                .rhs_editor()
+                .read(cx)
+                .review_comments_json(cx)
+                .unwrap()
         });
-        cx.run_until_parked();
-
-        let clipboard = cx
-            .read_from_clipboard()
-            .and_then(|item| item.text())
-            .unwrap();
-        assert!(clipboard.contains("command action"));
+        let stamped: serde_json::Value = serde_json::from_str(&stamped).unwrap();
+        assert_eq!(stamped["comments"][0]["review_round"], 1);
     }
 
     #[gpui::test]
@@ -5644,6 +5687,18 @@ mod tests {
             editor.submit_diff_review_comment(window, cx);
         });
         db.flush_writes().await.unwrap();
+        let review_key = diff.read_with(cx, |diff, cx| diff.review_comments_key(cx).unwrap());
+        let comments_json = db
+            .get_review_comments(workspace_id, &review_key)
+            .unwrap()
+            .unwrap();
+        let mut comments: serde_json::Value = serde_json::from_str(&comments_json).unwrap();
+        comments["comments"][0]["replies"] = serde_json::json!([
+            { "id": 1000, "author": "amp", "body": "reply on removed diff" }
+        ]);
+        db.save_review_comments(workspace_id, review_key, comments.to_string())
+            .await
+            .unwrap();
 
         fs.insert_file(path!("/project/foo.txt"), b"foo\n".to_vec())
             .await;
@@ -5665,6 +5720,10 @@ mod tests {
             restored["comments"][0]["outdated_reason"],
             "file_not_in_diff"
         );
+        assert_eq!(
+            restored["comments"][0]["replies"][0]["body"],
+            "reply on removed diff"
+        );
 
         reopened_diff.read_with(cx, |diff, _cx| {
             assert_eq!(diff.review_comment_count, 1);
@@ -5675,6 +5734,8 @@ mod tests {
             assert_eq!(orphaned[0].file, "foo.txt");
             assert_eq!(orphaned[0].line_start, 1);
             assert_eq!(orphaned[0].body, "removed diff comment");
+            assert_eq!(orphaned[0].replies.len(), 1);
+            assert_eq!(orphaned[0].replies[0].body, "reply on removed diff");
             assert_eq!(
                 orphaned[0].outdated_reason.as_deref(),
                 Some("file_not_in_diff")

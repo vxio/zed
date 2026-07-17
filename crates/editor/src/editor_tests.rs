@@ -42179,6 +42179,7 @@ fn test_review_comment_marked_outdated_after_line_removed(cx: &mut TestAppContex
                 hunk_start_anchor: anchor,
             };
             editor.add_review_comment(key, "Comment on line 2".to_string(), anchor..anchor, cx);
+            editor.add_review_reply(0, "Reply to outdated comment".to_string(), false, cx);
         })
         .unwrap();
 
@@ -42196,7 +42197,10 @@ fn test_review_comment_marked_outdated_after_line_removed(cx: &mut TestAppContex
                 comments["comments"][0]["outdated_reason"],
                 "line_not_in_diff"
             );
-            assert_eq!(editor.orphaned_review_comment_summaries().len(), 1);
+            let orphaned = editor.orphaned_review_comment_summaries();
+            assert_eq!(orphaned.len(), 1);
+            assert_eq!(orphaned[0].replies.len(), 1);
+            assert_eq!(orphaned[0].replies[0].body, "Reply to outdated comment");
             assert!(editor.stored_review_comments.is_empty());
         })
         .unwrap();
