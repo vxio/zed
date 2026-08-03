@@ -95,7 +95,7 @@ impl DiffMultibuffer {
         let primary_editor = editor.read(cx).rhs_editor().clone();
         let review_comment_subscription =
             cx.subscribe(&primary_editor, |this, _editor, event: &EditorEvent, cx| {
-                if let EditorEvent::ReviewCommentsChanged { total_count } = event {
+                if let EditorEvent::ReviewCommentsChanged { total_count, .. } = event {
                     this.review_comment_count = *total_count;
                     cx.notify();
                 }

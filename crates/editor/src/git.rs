@@ -16,6 +16,7 @@ use project::{
     PathMatchCandidateSet, Project, ProjectPath, Symbol, WorktreeId, git_store::Repository,
     lsp_store::SymbolLocation,
 };
+use sha2::{Digest, Sha256};
 use std::{
     cmp::Reverse,
     path::{Path, PathBuf},
@@ -349,6 +350,7 @@ pub(super) struct StoredReviewComment {
     pub(super) outdated_reason: Option<String>,
     pub(super) review_round: Option<u32>,
     pub(super) agent_feedback: bool,
+    anchor_text_hash: Option<String>,
     /// Runtime-only: expands a resolved thread in place without unresolving it.
     pub(super) show_resolved: bool,
     location: ReviewCommentLocation,
@@ -455,6 +457,12 @@ struct ReviewCommentMention {
     show_at_prefix: bool,
 }
 
+struct ReviewCommentMentionSpan {
+    start: usize,
+    len: usize,
+    mention: ReviewCommentMention,
+}
+
 struct ReviewCommentEditorAddon;
 
 impl Addon for ReviewCommentEditorAddon {
@@ -499,6 +507,8 @@ pub(super) struct ReviewCommentSnapshot {
     line_start: u32,
     line_end: u32,
     body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor_text_hash: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     outdated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1246,6 +1256,77 @@ fn parse_review_comment_body(comment: &str) -> Vec<Vec<ReviewCommentBodySegment>
         .collect()
 }
 
+fn review_comment_mention_spans(comment: &str) -> Vec<ReviewCommentMentionSpan> {
+    let mut spans = Vec::new();
+    let mut line_offset = 0;
+
+    for line_with_newline in comment.split_inclusive('\n') {
+        let line = line_with_newline
+            .strip_suffix('\n')
+            .unwrap_or(line_with_newline);
+        let mut remaining = line;
+        let mut offset = line_offset;
+
+        while let Some(open_index) = remaining.find('[') {
+            let link_start = &remaining[open_index..];
+            let Some(label_end) = find_review_comment_markdown_delimiter(link_start, '[', ']')
+            else {
+                break;
+            };
+            if link_start.get(label_end + 1..label_end + 2) != Some("(") {
+                offset += open_index + 1;
+                remaining = &link_start[1..];
+                continue;
+            }
+
+            let url_start = label_end + 2;
+            let Some(url_end_relative) =
+                find_review_comment_markdown_delimiter(&link_start[label_end + 1..], '(', ')')
+            else {
+                break;
+            };
+            let url_end = label_end + 1 + url_end_relative;
+            let raw_label = &link_start[1..label_end];
+            let (label, show_at_prefix) = raw_label
+                .strip_prefix('@')
+                .map_or((raw_label, false), |label| (label, true));
+            let url = &link_start[url_start..url_end];
+            if let Some(mention) = build_review_comment_mention(label, url) {
+                spans.push(ReviewCommentMentionSpan {
+                    start: offset + open_index,
+                    len: url_end + 1,
+                    mention: ReviewCommentMention {
+                        show_at_prefix,
+                        ..mention
+                    },
+                });
+            }
+
+            let consumed = open_index + url_end + 1;
+            offset += consumed;
+            remaining = &remaining[consumed..];
+        }
+
+        line_offset += line_with_newline.len();
+    }
+
+    spans
+}
+
+#[cfg(test)]
+mod review_comment_mention_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_line_does_not_hide_later_mentions() {
+        let comment = "array[\nSee [file](file:///tmp/file)";
+        let spans = review_comment_mention_spans(comment);
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].start, comment.find("[file]").unwrap());
+    }
+}
+
 fn parse_review_comment_line(line: &str) -> Vec<ReviewCommentBodySegment> {
     let mut segments = Vec::new();
     let mut remaining = line;
@@ -1531,6 +1612,7 @@ impl StoredReviewComment {
             outdated_reason: None,
             review_round: None,
             agent_feedback: false,
+            anchor_text_hash: None,
             show_resolved: false,
             location,
         }
@@ -1543,6 +1625,36 @@ impl Editor {
         Self::configure_review_comment_editor(&mut editor, cx);
         editor.register_addon(ReviewCommentEditorAddon);
         editor
+    }
+
+    fn review_comment_body_editor(
+        comment: String,
+        open_editor: WeakEntity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Editor> {
+        cx.new(|cx| {
+            let mut editor = Editor::auto_height_unbounded(1, window, cx);
+            editor.set_text(comment.clone(), window, cx);
+            editor.set_read_only(true);
+            editor.set_use_modal_editing(false);
+            let selection_color = cx.theme().colors().text_accent;
+            editor.set_read_only_player_color(Some(PlayerColor {
+                cursor: selection_color,
+                background: selection_color.opacity(0.45),
+                selection: selection_color.opacity(0.85),
+            }));
+            editor.set_cursor_shape(CursorShape::Block, cx);
+            editor.set_show_gutter(false, cx);
+            editor.set_show_line_numbers(false, cx);
+            editor.set_show_git_diff_gutter(false, cx);
+            editor.set_show_indent_guides(false, cx);
+            editor.set_show_vertical_scrollbar(false, cx);
+            editor.set_show_horizontal_scrollbar(false, cx);
+            editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
+            editor.insert_review_body_mention_creases(&comment, open_editor, window, cx);
+            editor
+        })
     }
 
     fn configure_review_comment_editor(editor: &mut Editor, cx: &mut Context<Self>) {
@@ -1690,6 +1802,37 @@ impl Editor {
         };
         self.insert_creases(vec![crease.clone()], cx);
         self.fold_creases(vec![crease], false, window, cx);
+    }
+
+    fn insert_review_body_mention_creases(
+        &mut self,
+        comment: &str,
+        open_editor: WeakEntity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.buffer().read(cx).snapshot(cx);
+        let Some(buffer_snapshot) = snapshot.as_singleton() else {
+            return;
+        };
+        for span in review_comment_mention_spans(comment) {
+            let label = if span.mention.show_at_prefix {
+                format!("@{}", span.mention.label)
+            } else {
+                span.mention.label
+            };
+            self.insert_review_mention_crease_with_opener(
+                buffer_snapshot.anchor_before(span.start),
+                span.len,
+                label.into(),
+                span.mention.icon.path().into(),
+                Some(span.mention.url.into()),
+                span.mention.tooltip,
+                open_editor.clone(),
+                window,
+                cx,
+            );
+        }
     }
 
     fn focus_review_comment_editor(
@@ -2111,8 +2254,23 @@ impl Editor {
             end_point.row,
             buffer_snapshot.line_len(end_multi_buffer_row),
         );
+        let line_start = Point::new(start_point.row, 0);
+        let source_range_is_empty = line_start == line_end;
+        let source_ranges = buffer_snapshot
+            .range_to_buffer_ranges(line_start..line_end)
+            .into_iter()
+            .filter(|(_, range, _)| source_range_is_empty || !range.is_empty())
+            .collect::<Vec<_>>();
+        let includes_deleted_text = buffer_snapshot
+            .range_to_buffer_ranges_with_deleted_hunks(line_start..line_end)
+            .any(|(_, range, deleted_hunk_anchor)| {
+                deleted_hunk_anchor.is_some() && !range.is_empty()
+            });
+        if source_ranges.len() != 1 || includes_deleted_text {
+            return;
+        }
         let anchor_range =
-            buffer_snapshot.anchor_after(start_point)..buffer_snapshot.anchor_before(line_end);
+            buffer_snapshot.anchor_after(line_start)..buffer_snapshot.anchor_before(line_end);
 
         // Compute the hunk key for this display row
         let file_path = buffer_snapshot
@@ -2122,7 +2280,12 @@ impl Editor {
                 buffer_snapshot
                     .buffers_with_paths()
                     .find(|(snapshot, _)| snapshot.remote_id() == hunk.buffer_id)
-                    .map(|(_, path_key)| path_key.path.clone())
+                    .map(|(snapshot, path_key)| {
+                        snapshot
+                            .file()
+                            .map(|file| file.path().clone())
+                            .unwrap_or_else(|| path_key.path.clone())
+                    })
             })
             .or_else(|| {
                 buffer_snapshot
@@ -2442,7 +2605,10 @@ impl Editor {
                 if let Some(reason) = reason {
                     comment.outdated = true;
                     comment.outdated_reason = Some(reason);
-                    orphaned_comments.push(Self::review_comment_snapshot(&comment));
+                    orphaned_comments.push(Self::review_comment_snapshot(
+                        &comment,
+                        comment.location.clone(),
+                    ));
                     changed = true;
                 } else {
                     if comment.outdated || comment.outdated_reason.is_some() {
@@ -2476,15 +2642,28 @@ impl Editor {
         comment: &StoredReviewComment,
         snapshot: &MultiBufferSnapshot,
     ) -> Option<String> {
-        let file_has_visible_diff = snapshot
-            .buffers_with_paths()
-            .any(|(_, path_key)| path_key.path == key.file_path);
+        let file_has_visible_diff =
+            snapshot
+                .buffers_with_paths()
+                .any(|(buffer_snapshot, path_key)| {
+                    buffer_snapshot
+                        .file()
+                        .map(|file| file.path().as_ref() == key.file_path.as_ref())
+                        .unwrap_or(path_key.path == key.file_path)
+                });
         if !file_has_visible_diff {
             return Some("file_not_in_diff".to_string());
         }
 
         if !comment.range.start.is_valid(snapshot) || !comment.range.end.is_valid(snapshot) {
             return Some("line_not_in_diff".to_string());
+        }
+
+        if let Some(anchor_text_hash) = comment.anchor_text_hash.as_deref()
+            && Self::review_comment_anchor_text_hash(&comment.range, snapshot).as_deref()
+                != Some(anchor_text_hash)
+        {
+            return Some("line_changed".to_string());
         }
 
         let start = comment.range.start.to_point(snapshot);
@@ -2498,11 +2677,40 @@ impl Editor {
             snapshot
                 .buffers_with_paths()
                 .any(|(buffer_snapshot, path_key)| {
-                    buffer_snapshot.remote_id() == hunk.buffer_id && path_key.path == key.file_path
+                    buffer_snapshot.remote_id() == hunk.buffer_id
+                        && buffer_snapshot
+                            .file()
+                            .map(|file| file.path().as_ref() == key.file_path.as_ref())
+                            .unwrap_or(path_key.path == key.file_path)
                 })
         });
 
         (!has_hunk).then(|| "line_not_in_diff".to_string())
+    }
+
+    fn review_comment_anchor_text_hash(
+        range: &Range<Anchor>,
+        snapshot: &MultiBufferSnapshot,
+    ) -> Option<String> {
+        if !range.start.is_valid(snapshot) || !range.end.is_valid(snapshot) {
+            return None;
+        }
+
+        let start = range.start.to_point(snapshot);
+        let end = range.end.to_point(snapshot);
+        let range_is_empty = start == end;
+        let mut buffer_ranges = snapshot
+            .range_to_buffer_ranges(start..end)
+            .into_iter()
+            .filter(|(_, range, _)| range_is_empty || !range.is_empty());
+        let (buffer_snapshot, buffer_range, _) = buffer_ranges.next()?;
+        if buffer_ranges.next().is_some() {
+            return None;
+        }
+        let text = buffer_snapshot
+            .text_for_range(buffer_range)
+            .collect::<String>();
+        Some(format!("{:x}", Sha256::digest(text.as_bytes())))
     }
 
     pub(super) fn add_review_comment(
@@ -2517,7 +2725,10 @@ impl Editor {
 
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let location = Self::review_comment_location(&hunk_key, &anchor_range, &snapshot);
-        let stored_comment = StoredReviewComment::new(id, comment, anchor_range, location);
+        let mut stored_comment =
+            StoredReviewComment::new(id, comment, anchor_range.clone(), location);
+        stored_comment.anchor_text_hash =
+            Self::review_comment_anchor_text_hash(&anchor_range, &snapshot);
         let key_point = hunk_key.hunk_start_anchor.to_point(&snapshot);
 
         if let Some((_, comments)) = self.stored_review_comments.iter_mut().find(|(k, _)| {
@@ -3319,6 +3530,55 @@ impl Editor {
             .clear();
     }
 
+    pub(super) fn materialize_review_comment_body_editor(
+        &mut self,
+        hunk_key: &DiffHunkKey,
+        id: usize,
+        is_reply: bool,
+        comment: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let Some(overlay_index) = self
+            .diff_review_overlays
+            .iter()
+            .position(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, &snapshot))
+        else {
+            return;
+        };
+        let already_materialized = if is_reply {
+            self.diff_review_overlays[overlay_index]
+                .reply_body_editors
+                .contains_key(&id)
+        } else {
+            self.diff_review_overlays[overlay_index]
+                .body_editors
+                .contains_key(&id)
+        };
+        if already_materialized {
+            return;
+        }
+
+        for overlay in &mut self.diff_review_overlays {
+            overlay
+                .body_editors
+                .retain(|_, editor| editor.focus_handle(cx).is_focused(window));
+            overlay
+                .reply_body_editors
+                .retain(|_, editor| editor.focus_handle(cx).is_focused(window));
+        }
+        let body_editor =
+            Self::review_comment_body_editor(comment, cx.entity().downgrade(), window, cx);
+        let body_editors = if is_reply {
+            &mut self.diff_review_overlays[overlay_index].reply_body_editors
+        } else {
+            &mut self.diff_review_overlays[overlay_index].body_editors
+        };
+        body_editors.insert(id, body_editor);
+        cx.notify();
+    }
+
     fn hunk_key_for_review_comment(&self, id: usize) -> Option<DiffHunkKey> {
         self.stored_review_comments
             .iter()
@@ -3730,8 +3990,8 @@ impl Editor {
         }
     }
 
-    pub fn review_comments_json(&self, _cx: &App) -> anyhow::Result<String> {
-        self.review_comments_json_with_deleted(true)
+    pub fn review_comments_json(&self, cx: &App) -> anyhow::Result<String> {
+        self.review_comments_json_with_deleted(true, cx)
     }
 
     pub fn orphaned_review_comment_summaries(&self) -> Vec<OrphanedReviewCommentSummary> {
@@ -3757,26 +4017,39 @@ impl Editor {
             .collect()
     }
 
-    fn active_review_comments_json(&self, _cx: &App) -> anyhow::Result<String> {
-        self.review_comments_json_with_deleted(false)
+    fn active_review_comments_json(&self, cx: &App) -> anyhow::Result<String> {
+        self.review_comments_json_with_deleted(false, cx)
     }
 
-    fn review_comments_json_with_deleted(&self, include_deleted: bool) -> anyhow::Result<String> {
+    fn review_comments_json_with_deleted(
+        &self,
+        include_deleted: bool,
+        cx: &App,
+    ) -> anyhow::Result<String> {
         let mut comments = self.orphaned_review_comments.clone();
         if !include_deleted {
             comments.retain(|comment| comment.deleted_on.is_none());
         }
 
-        for (_, hunk_comments) in &self.stored_review_comments {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        for (key, hunk_comments) in &self.stored_review_comments {
             for comment in hunk_comments {
                 if include_deleted || comment.deleted_on.is_none() {
-                    comments.push(Self::review_comment_snapshot(comment));
+                    let location = if key.hunk_start_anchor.is_valid(&snapshot)
+                        && comment.range.start.is_valid(&snapshot)
+                        && comment.range.end.is_valid(&snapshot)
+                    {
+                        Self::review_comment_location(key, &comment.range, &snapshot)
+                    } else {
+                        comment.location.clone()
+                    };
+                    comments.push(Self::review_comment_snapshot(comment, location));
                 }
             }
         }
 
         serde_json::to_string_pretty(&ReviewCommentsSnapshot {
-            schema_version: 1,
+            schema_version: 3,
             comments,
         })
         .context("serializing review comments")
@@ -3825,9 +4098,10 @@ impl Editor {
         }
     }
 
-    fn review_comment_snapshot(comment: &StoredReviewComment) -> ReviewCommentSnapshot {
-        let location = comment.location.clone();
-
+    fn review_comment_snapshot(
+        comment: &StoredReviewComment,
+        location: ReviewCommentLocation,
+    ) -> ReviewCommentSnapshot {
         ReviewCommentSnapshot {
             id: comment.id,
             author: comment.author.clone(),
@@ -3840,6 +4114,7 @@ impl Editor {
             line_start: location.line_start,
             line_end: location.line_end,
             body: comment.comment.clone(),
+            anchor_text_hash: comment.anchor_text_hash.clone(),
             outdated: comment.outdated,
             outdated_reason: comment.outdated_reason.clone(),
             review_round: comment.review_round,
@@ -3867,6 +4142,7 @@ impl Editor {
     ) -> anyhow::Result<usize> {
         let restored: ReviewCommentsSnapshot =
             serde_json::from_str(json).context("deserializing review comments")?;
+        let has_stable_file_paths = restored.schema_version >= 2;
 
         // Reloads (e.g. an agent writing a reply to the DB) rebuild every overlay from
         // scratch. Remember each thread's current expand/collapse state so a reload doesn't
@@ -3908,14 +4184,47 @@ impl Editor {
                     self.next_review_reply_id.max(reply.id.saturating_add(1));
             }
 
-            let file_path = util::rel_path::RelPath::unix(saved_comment.file.as_str())?;
+            let file_path = util::rel_path::RelPath::from_unix_str(saved_comment.file.as_str())?;
             let attachment = (|| {
-                let Some((buffer_snapshot, path_key)) = snapshot
-                    .buffers_with_paths()
-                    .find(|(_, path_key)| path_key.path.as_ref() == file_path)
-                else {
+                let legacy_file_path = (!has_stable_file_paths)
+                    .then(|| legacy_review_comment_file_path(file_path))
+                    .flatten();
+                let exact_file_is_ambiguous = legacy_file_path.is_some()
+                    && snapshot
+                        .buffers_with_paths()
+                        .any(|(buffer_snapshot, path_key)| {
+                            buffer_snapshot
+                                .file()
+                                .map(|file| file.path().as_ref())
+                                .unwrap_or(path_key.path.as_ref())
+                                == file_path
+                        });
+                if exact_file_is_ambiguous {
+                    return Err("file_not_in_diff");
+                }
+                let mut matching_buffers =
+                    snapshot
+                        .buffers_with_paths()
+                        .filter(|(buffer_snapshot, path_key)| {
+                            let path = buffer_snapshot
+                                .file()
+                                .map(|file| file.path().as_ref())
+                                .unwrap_or(path_key.path.as_ref());
+                            if legacy_file_path.is_some() && path == file_path {
+                                return false;
+                            }
+                            legacy_file_path
+                                .as_deref()
+                                .map_or(path == file_path, |legacy_file_path| {
+                                    path == legacy_file_path
+                                })
+                        });
+                let Some((buffer_snapshot, path_key)) = matching_buffers.next() else {
                     return Err("file_not_in_diff");
                 };
+                if matching_buffers.next().is_some() {
+                    return Err("file_not_in_diff");
+                }
 
                 let start_row = saved_comment
                     .line_start
@@ -3932,15 +4241,18 @@ impl Editor {
                 }
 
                 let line_end = Point::new(end_row, buffer_snapshot.line_len(end_row));
-                let buffer_anchor_range = buffer_snapshot.anchor_before(Point::new(start_row, 0))
-                    ..buffer_snapshot.anchor_after(line_end);
+                let buffer_anchor_range = buffer_snapshot.anchor_after(Point::new(start_row, 0))
+                    ..buffer_snapshot.anchor_before(line_end);
                 let anchor_range = snapshot
                     .anchor_range_in_buffer(buffer_anchor_range)
                     .ok_or("line_not_in_diff")?;
 
                 Ok((
                     DiffHunkKey {
-                        file_path: path_key.path.clone(),
+                        file_path: buffer_snapshot
+                            .file()
+                            .map(|file| file.path().clone())
+                            .unwrap_or_else(|| path_key.path.clone()),
                         hunk_start_anchor: anchor_range.start,
                     },
                     anchor_range,
@@ -3956,6 +4268,21 @@ impl Editor {
                     continue;
                 }
             };
+
+            if let Some(anchor_text_hash) = saved_comment.anchor_text_hash.as_deref()
+                && Self::review_comment_anchor_text_hash(&anchor_range, &snapshot).as_deref()
+                    != Some(anchor_text_hash)
+            {
+                saved_comment.outdated = true;
+                saved_comment.outdated_reason = Some("line_changed".to_string());
+                self.orphaned_review_comments.push(saved_comment);
+                continue;
+            }
+
+            if saved_comment.outdated_reason.as_deref() == Some("file_not_in_diff") {
+                saved_comment.outdated = false;
+                saved_comment.outdated_reason = None;
+            }
 
             let location = ReviewCommentLocation {
                 file: saved_comment.file,
@@ -3993,6 +4320,7 @@ impl Editor {
                 outdated_reason: saved_comment.outdated_reason,
                 review_round: saved_comment.review_round,
                 agent_feedback: saved_comment.agent_feedback,
+                anchor_text_hash: saved_comment.anchor_text_hash,
                 ..comment
             };
 
@@ -6202,6 +6530,7 @@ impl Editor {
                     let reply_body_editors = reply_body_editors.clone();
                     Self::render_comment_row(
                         comment,
+                        hunk_key.clone(),
                         inline_editor,
                         inline_reply_editors,
                         reply_editor,
@@ -6220,6 +6549,7 @@ impl Editor {
 
     fn render_comment_row(
         comment: StoredReviewComment,
+        hunk_key: DiffHunkKey,
         inline_editor: Option<Entity<Editor>>,
         inline_reply_editors: HashMap<usize, Entity<Editor>>,
         reply_editor: Option<Entity<Editor>>,
@@ -6660,6 +6990,9 @@ impl Editor {
                             } else {
                                 Self::render_review_comment_body(
                                     comment.comment,
+                                    hunk_key.clone(),
+                                    comment_id,
+                                    false,
                                     body_editor_handle,
                                     colors,
                                 )
@@ -6931,6 +7264,9 @@ impl Editor {
                             } else {
                                 Self::render_review_comment_body(
                                     reply.comment,
+                                    hunk_key.clone(),
+                                    reply_id,
+                                    true,
                                     reply_body_editor_handle,
                                     colors,
                                 )
@@ -7139,19 +7475,43 @@ impl Editor {
             .into_any_element()
     }
 
-    fn render_review_comment_body(
+    pub(super) fn render_review_comment_body(
         comment: String,
+        hunk_key: DiffHunkKey,
+        id: usize,
+        is_reply: bool,
         editor_handle: WeakEntity<Editor>,
         colors: &theme::ThemeColors,
     ) -> AnyElement {
         let text_color = colors.text;
         let border_color = colors.border_variant;
         let background = colors.element_background;
+        let comment_for_hover = comment.clone();
+        let editor_handle_for_hover = editor_handle.clone();
 
         v_flex()
             .w_full()
             .min_w_0()
             .gap_0p5()
+            .on_children_prepainted(move |bounds, window, cx| {
+                if !bounds
+                    .iter()
+                    .any(|bounds| bounds.contains(&window.mouse_position()))
+                {
+                    return;
+                }
+                if let Some(editor) = editor_handle_for_hover.upgrade() {
+                    let hunk_key = hunk_key.clone();
+                    let comment = comment_for_hover.clone();
+                    window.defer(cx, move |window, cx| {
+                        editor.update(cx, |editor, cx| {
+                            editor.materialize_review_comment_body_editor(
+                                &hunk_key, id, is_reply, comment, window, cx,
+                            );
+                        });
+                    });
+                }
+            })
             .children(parse_review_comment_body(&comment).into_iter().map(|line| {
                 if let [ReviewCommentBodySegment::Text(text)] = line.as_slice() {
                     return div()
@@ -7444,6 +7804,28 @@ impl Editor {
             project.get_permalink_to_line(&buffer, selection, cx)
         })
     }
+}
+
+fn legacy_review_comment_file_path(
+    file_path: &util::rel_path::RelPath,
+) -> Option<Arc<util::rel_path::RelPath>> {
+    let path = file_path.as_unix_str();
+    if path.contains('\0') {
+        let mut decoded = String::with_capacity(path.len());
+        for (index, component) in path.split('/').enumerate() {
+            if index > 0 {
+                decoded.push('/');
+            }
+            decoded.push_str(component.strip_prefix('\0').unwrap_or(component));
+        }
+        return util::rel_path::RelPath::from_unix_str(&decoded)
+            .ok()
+            .map(|path| path.into_arc());
+    }
+
+    let (sort_name, repo_path) = path.split_once('/')?;
+    let repo_path = util::rel_path::RelPath::from_unix_str(repo_path).ok()?;
+    (repo_path.file_name() == Some(sort_name)).then(|| repo_path.into_arc())
 }
 
 #[cfg(test)]

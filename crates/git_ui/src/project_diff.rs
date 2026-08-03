@@ -7,10 +7,10 @@ use crate::{
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
 use buffer_diff::{BufferDiff, DiffHunkSecondaryStatus};
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use editor::{
-    Addon, Editor, EditorEvent, EditorSettings, OrphanedReviewCommentSummary, SelectionEffects,
-    SplittableEditor,
+    Addon, Editor, EditorEvent, EditorSettings, OrphanedReviewCommentSummary,
+    RestoreOnlyDiffHunkDelegate, SelectionEffects, SplittableEditor,
     actions::{GoToHunk, GoToPreviousHunk, SendReviewToAgent},
     multibuffer_context_lines,
     scroll::Autoscroll,
@@ -36,6 +36,8 @@ use project::{
         branch_diff::{self, BranchDiffEvent, DiffBase},
     },
 };
+use schemars::JsonSchema;
+use serde::Deserialize;
 use settings::{
     GitDiffBaseSetting, GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore,
 };
@@ -46,7 +48,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use theme::ActiveTheme;
 use ui::{
     CommonAnimationExt as _, DiffStat, Divider, KeyBinding, PopoverMenu, Tooltip, prelude::*,
-    vertical_divider,
 };
 use util::{ResultExt as _, rel_path::RelPath};
 use workspace::{
@@ -80,6 +81,10 @@ actions!(
         CompareWithBranch,
     ]
 );
+
+#[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
+#[action(namespace = git, name = "DiffBranch", deprecated_aliases = ["git::BranchDiff"])]
+pub(crate) struct DeployBranchDiff;
 
 struct BufferSubscriptions {
     _diff: Entity<BufferDiff>,
@@ -126,6 +131,7 @@ pub struct ProjectDiff {
     review_comment_count: usize,
     loaded_review_comments_key: Option<String>,
     loaded_review_comments_json: Option<String>,
+    last_observed_review_comments_db_json: Option<String>,
     last_review_comments_db_modified_on: Option<SystemTime>,
     restoring_review_comments: bool,
     review_comments_fully_restored: bool,
@@ -163,6 +169,7 @@ enum RestoreLatestReviewCommentsResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CopyAmpPromptResult {
     Copied,
+    Saving,
     AlreadyInProgress,
     Failed(&'static str),
 }
@@ -513,6 +520,15 @@ impl ProjectDiff {
                         "Copied Amp prompt to clipboard.",
                     )
                     .autohide(),
+                    cx,
+                );
+            }
+            CopyAmpPromptResult::Saving => {
+                workspace.show_toast(
+                    Toast::new(
+                        copy_amp_prompt_notification_id(),
+                        "Saving review comments before copying Amp prompt…",
+                    ),
                     cx,
                 );
             }
@@ -1002,44 +1018,93 @@ impl ProjectDiff {
             return CopyAmpPromptResult::AlreadyInProgress;
         }
 
-        let Ok((comments_json, prompt)) = generate_amp_prompt_for_unstamped_review_comments(
-            repo,
-            review_key.clone(),
-            comments_json,
-        ) else {
+        if stamp_unstamped_review_comments(&comments_json).is_err() {
             return CopyAmpPromptResult::Failed(
                 "No unstamped review comments are available to copy.",
             );
-        };
-
-        cx.write_to_clipboard(ClipboardItem::new_string(prompt));
-        self.loaded_review_comments_json = Some(comments_json.clone());
-        self.restoring_review_comments = true;
-        self.editor.update(cx, |editor, cx| {
-            let editor = editor.rhs_editor();
-            editor.update(cx, |editor, cx| {
-                if let Err(error) = editor.restore_review_comments_json(&comments_json, window, cx)
-                {
-                    log::error!("failed to restore stamped review comments: {error:#}");
-                }
-            });
-        });
-        self.restoring_review_comments = false;
+        }
 
         self.copy_amp_prompt_in_progress = true;
         cx.notify();
 
         let db = persistence::ProjectDiffDb::global(cx);
+        let original_comments_json = self
+            .editor
+            .read(cx)
+            .rhs_editor()
+            .read(cx)
+            .review_comments_json(cx)
+            .unwrap_or_default();
         let workspace = self.workspace.clone();
-        let error_workspace = self.workspace.clone();
-        let this = cx.entity().downgrade();
-        window
-            .spawn(cx, async move |cx| {
+        let window_handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
                 let result = async {
-                    db.save_review_comments(workspace_id, review_key, comments_json)
+                    let (persisted_comments_json, review_round) = db
+                        .save_and_stamp_review_comments(
+                            workspace_id,
+                            review_key.clone(),
+                            comments_json,
+                        )
                         .await
-                        .context("saving stamped review comments after copying Amp prompt")?;
-                    anyhow::Ok(())
+                        .context("saving stamped review comments before copying Amp prompt")?;
+                    let prompt = amp_prompt_for_review_round(
+                        repo,
+                        review_key,
+                        &persisted_comments_json,
+                        review_round,
+                    )?;
+                    cx.update_window(window_handle, |_, window, cx| {
+                        this.update(cx, |this, cx| {
+                            let editor = this.editor.read(cx).rhs_editor().clone();
+                            if editor.read(cx).has_active_diff_review_input() {
+                                return;
+                            }
+                            let restored_comments_json = editor
+                                .read(cx)
+                                .review_comments_json(cx)
+                                .and_then(|live_comments_json| {
+                                    preserve_live_review_comment_locations(
+                                        &original_comments_json,
+                                        &live_comments_json,
+                                        &persisted_comments_json,
+                                    )
+                                })
+                                .map(|comments_json| {
+                                    comments_json
+                                        .unwrap_or_else(|| persisted_comments_json.clone())
+                                });
+                            let restored_comments_json = match restored_comments_json {
+                                Ok(restored_comments_json) => restored_comments_json,
+                                Err(error) => {
+                                    log::error!(
+                                        "failed to preserve review comment locations while stamping: {error:#}"
+                                    );
+                                    return;
+                                }
+                            };
+                            this.restoring_review_comments = true;
+                            let restore_result = editor.update(cx, |editor, cx| {
+                                editor.restore_review_comments_json(
+                                    &restored_comments_json,
+                                    window,
+                                    cx,
+                                )
+                            });
+                            this.restoring_review_comments = false;
+                            if let Err(error) = restore_result {
+                                log::error!(
+                                    "failed to restore stamped review comments: {error:#}"
+                                );
+                                return;
+                            }
+                            this.loaded_review_comments_json = Some(restored_comments_json.clone());
+                            this.last_observed_review_comments_db_json =
+                                Some(persisted_comments_json.clone());
+                        })
+                        .ok();
+                    })
+                    .ok();
+                    anyhow::Ok(prompt)
                 }
                 .await;
 
@@ -1049,24 +1114,41 @@ impl ProjectDiff {
                 })
                 .ok();
 
-                if result.is_err() {
-                    workspace.update(cx, |workspace, cx| {
-                        workspace.show_toast(
-                            Toast::new(
-                                copy_amp_prompt_notification_id(),
-                                "Copied Amp prompt, but failed to save stamped review comments.",
-                            )
-                            .autohide(),
-                            cx,
-                        );
-                    })?;
+                match result {
+                    Ok(prompt) => {
+                        cx.update(|cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(prompt));
+                        });
+                        workspace.update(cx, |workspace, cx| {
+                            Self::show_copy_amp_prompt_result(
+                                workspace,
+                                CopyAmpPromptResult::Copied,
+                                cx,
+                            );
+                        })
+                        .ok();
+                    }
+                    Err(error) => {
+                        log::error!("{error:#}");
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.show_toast(
+                                Toast::new(
+                                    copy_amp_prompt_notification_id(),
+                                    "Failed to save review comments; Amp prompt was not copied.",
+                                )
+                                .autohide(),
+                                cx,
+                            );
+                        })
+                        .ok();
+                    }
                 }
 
-                result
+                anyhow::Ok(())
             })
-            .detach_and_notify_err(error_workspace, window, cx);
+            .detach_and_log_err(cx);
 
-        CopyAmpPromptResult::Copied
+        CopyAmpPromptResult::Saving
     }
 
     fn archive_review_comments(
@@ -1286,7 +1368,7 @@ impl ProjectDiff {
         }
         if !force_reattach
             && self.loaded_review_comments_key.as_ref() == Some(&review_key)
-            && self.loaded_review_comments_json.as_deref() == comments_json.as_deref()
+            && self.last_observed_review_comments_db_json.as_deref() == comments_json.as_deref()
         {
             self.last_review_comments_db_modified_on = db_modified_on;
             return;
@@ -1301,15 +1383,38 @@ impl ProjectDiff {
             return;
         }
 
+        let observed_comments_json = comments_json.clone();
         let mut loaded = true;
+        let mut locations_rebased = false;
         if let Some(comments_json) = comments_json.as_mut() {
-            let snapshot = self.multibuffer.read(cx).snapshot(cx);
-            let visible_paths = snapshot
-                .buffers_with_paths()
-                .map(|(_, path_key)| path_key.path.clone())
-                .collect::<Vec<_>>();
-            if let Some(remapped) = remap_review_comment_paths(comments_json, &visible_paths) {
-                *comments_json = remapped;
+            if loaded_key == review_key
+                && self.loaded_review_comments_key.as_ref() == Some(&review_key)
+                && let Some(base_comments_json) =
+                    self.last_observed_review_comments_db_json.as_deref()
+                && base_comments_json != comments_json
+            {
+                let live_comments_json = self
+                    .editor
+                    .read(cx)
+                    .rhs_editor()
+                    .read(cx)
+                    .review_comments_json(cx);
+                match live_comments_json.and_then(|live_comments_json| {
+                    preserve_live_review_comment_locations(
+                        base_comments_json,
+                        &live_comments_json,
+                        comments_json,
+                    )
+                }) {
+                    Ok(Some(rebased)) => {
+                        *comments_json = rebased;
+                        locations_rebased = true;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        log::error!("failed to preserve live review comment locations: {error:#}")
+                    }
+                }
             }
         }
         self.restoring_review_comments = true;
@@ -1335,6 +1440,19 @@ impl ProjectDiff {
             })
         });
         self.restoring_review_comments = false;
+        if loaded
+            && comments_json.is_some()
+            && let Ok(restored_comments_json) = self
+                .editor
+                .read(cx)
+                .rhs_editor()
+                .read(cx)
+                .review_comments_json(cx)
+            && comments_json.as_deref() != Some(restored_comments_json.as_str())
+        {
+            comments_json = Some(restored_comments_json);
+            locations_rebased = true;
+        }
         // Cache the attempt even when some comments failed to attach; refresh()
         // retries attachment explicitly. Re-restoring from the poll instead would
         // rebuild every overlay once a second and leak the editors they create.
@@ -1344,9 +1462,21 @@ impl ProjectDiff {
             if let Some(comments_json) = comments_json.clone() {
                 self.persist_review_comments(comments_json, cx);
             }
+        } else if locations_rebased
+            && let (Some(observed), Some(rebased)) =
+                (observed_comments_json.clone(), comments_json.clone())
+        {
+            let save = db.replace_review_comments_if_unchanged(
+                workspace_id,
+                review_key.clone(),
+                observed,
+                rebased,
+            );
+            cx.background_spawn(save).detach_and_log_err(cx);
         }
         self.loaded_review_comments_key = Some(review_key);
         self.loaded_review_comments_json = comments_json;
+        self.last_observed_review_comments_db_json = observed_comments_json;
     }
 
     #[cfg(test)]
@@ -1454,7 +1584,8 @@ impl ProjectDiff {
             );
             match branch_diff.read(cx).diff_base() {
                 DiffBase::Head => {}
-                DiffBase::Merge { .. } => diff_display_editor.disable_diff_hunk_controls(cx),
+                DiffBase::Merge { .. } => diff_display_editor
+                    .set_diff_hunk_delegate(Some(Arc::new(RestoreOnlyDiffHunkDelegate)), cx),
             }
             diff_display_editor.rhs_editor().update(cx, |editor, cx| {
                 editor.set_show_diff_review_button(true, cx);
@@ -1577,6 +1708,7 @@ impl ProjectDiff {
             review_comment_count: 0,
             loaded_review_comments_key: None,
             loaded_review_comments_json: None,
+            last_observed_review_comments_db_json: None,
             last_review_comments_db_modified_on: None,
             restoring_review_comments: false,
             review_comments_fully_restored: true,
@@ -1860,8 +1992,7 @@ impl ProjectDiff {
                         cx,
                     );
                 }
-                buffer_diff::BufferDiffEvent::BaseTextChanged
-                | buffer_diff::BufferDiffEvent::HunksStagedOrUnstaged(_) => {}
+                buffer_diff::BufferDiffEvent::BaseTextChanged => {}
             }
         });
         let conflict_set_subscription = cx.subscribe_in(&conflict_set, window, {
@@ -2148,13 +2279,9 @@ impl ProjectDiff {
     }
 }
 
-fn generate_amp_prompt_for_unstamped_review_comments(
-    repo: String,
-    review_key: String,
-    comments_json: String,
-) -> Result<(String, String)> {
+fn stamp_unstamped_review_comments(comments_json: &str) -> Result<(String, u64)> {
     let mut snapshot: serde_json::Value =
-        serde_json::from_str(&comments_json).context("deserializing review comments")?;
+        serde_json::from_str(comments_json).context("deserializing review comments")?;
     let schema_version = snapshot
         .get("schema_version")
         .and_then(|version| version.as_u64())
@@ -2188,10 +2315,29 @@ fn generate_amp_prompt_for_unstamped_review_comments(
         return Err(anyhow!("No unstamped review comments found"));
     }
 
+    let stamped_json = serde_json::json!({
+        "schema_version": schema_version,
+        "comments": comments,
+    })
+    .to_string();
+    Ok((stamped_json, next_round))
+}
+
+fn amp_prompt_for_review_round(
+    repo: String,
+    review_key: String,
+    comments_json: &str,
+    review_round: u64,
+) -> Result<String> {
+    let snapshot: serde_json::Value =
+        serde_json::from_str(comments_json).context("deserializing review comments")?;
+    let comments = snapshot
+        .get("comments")
+        .and_then(|comments| comments.as_array())
+        .context("review comments JSON is missing comments array")?;
     let queue_comments = comments
         .iter()
-        .filter(|comment| review_item_author(comment, "vxio") == "vxio")
-        .filter(|comment| review_comment_contains_round(comment, next_round))
+        .filter(|comment| review_comment_contains_round(comment, review_round))
         .map(compact_review_comment_for_prompt)
         .collect::<Vec<_>>();
     if queue_comments.is_empty() {
@@ -2209,7 +2355,7 @@ fn generate_amp_prompt_for_unstamped_review_comments(
     });
     let prompt = [
         format!(
-            "Address my newest Zed Git diff review comments for this repo — these are now Review #{next_round}."
+            "Address my newest Zed Git diff review comments for this repo — these are now Review #{review_round}."
         ),
         "".to_string(),
         format!(
@@ -2228,23 +2374,17 @@ fn generate_amp_prompt_for_unstamped_review_comments(
         "```".to_string(),
         "".to_string(),
         format!(
-            "Each comment/reply below carries a `review` round number. The threads are shown in full for context, but only act on the items whose `review` number is {next_round}. Treat every other item in each thread as settled context; do not redo it. Make the smallest correct code changes. If an item is a question or is not actionable, answer it in chat instead of inventing a change. After editing, run the narrowest useful verification."
+            "Each comment/reply below carries a `review` round number. The threads are shown in full for context, but only act on the items whose `review` number is {review_round}. Treat every other item in each thread as settled context; do not redo it. Make the smallest correct code changes. If an item is a question or is not actionable, answer it in chat instead of inventing a change. After editing, run the narrowest useful verification."
         ),
         "".to_string(),
         format!(
-            "Before changing code, load the `addressing-zed-review-comments` skill and follow it for marker capture, reply posting, reply verification, workflow-evolution, and refresh behavior. If you need to refresh the queue, call `zed_review_comments_list` with author `vxio`, the repo path and reviewKey above, and round `{next_round}` so you stay scoped to this round."
+            "Before changing code, load the `addressing-zed-review-comments` skill and follow it for marker capture, reply posting, reply verification, workflow-evolution, and refresh behavior. If you need to refresh the queue, call `zed_review_comments_list` with author `vxio`, the repo path and reviewKey above, and round `{review_round}` so you stay scoped to this round."
         ),
         "".to_string(),
         serde_json::to_string(&compact_packet).context("serializing Amp prompt packet")?,
     ]
     .join("\n");
-
-    let stamped_json = serde_json::json!({
-        "schema_version": schema_version,
-        "comments": comments,
-    })
-    .to_string();
-    Ok((stamped_json, prompt))
+    Ok(prompt)
 }
 
 fn review_item_author<'a>(item: &'a serde_json::Value, default_author: &'a str) -> &'a str {
@@ -2429,7 +2569,7 @@ fn name_sort_path(repo_path: &RelPath) -> Arc<RelPath> {
         return repo_path.into_arc();
     };
     let synthetic = format!("{}/{}", file_name, repo_path.as_unix_str());
-    RelPath::unix(&synthetic)
+    RelPath::from_unix_str(&synthetic)
         .map(|path| path.into_arc())
         .unwrap_or_else(|_| repo_path.into_arc())
 }
@@ -2454,100 +2594,9 @@ fn tree_sort_path(repo_path: &RelPath) -> Arc<RelPath> {
         }
         synthetic.push_str(component);
     }
-    RelPath::unix(&synthetic)
+    RelPath::from_unix_str(&synthetic)
         .map(|path| path.into_arc())
         .unwrap_or_else(|_| repo_path.into_arc())
-}
-
-fn remap_review_comment_paths(
-    comments_json: &str,
-    visible_paths: &[Arc<RelPath>],
-) -> Option<String> {
-    let mut snapshot = serde_json::from_str::<serde_json::Value>(comments_json).ok()?;
-    let comments = snapshot.get_mut("comments")?.as_array_mut()?;
-    let mut changed = false;
-
-    for comment in comments {
-        let Some(file) = comment.get("file").and_then(|file| file.as_str()) else {
-            continue;
-        };
-        if visible_paths.iter().any(|path| path.as_unix_str() == file) {
-            continue;
-        }
-        let Some(new_path) = review_comment_rename_candidate(file, visible_paths) else {
-            continue;
-        };
-        let Some(comment) = comment.as_object_mut() else {
-            continue;
-        };
-        comment.insert("file".to_string(), serde_json::Value::String(new_path));
-        let outdated_reason = comment
-            .get("outdated_reason")
-            .and_then(|reason| reason.as_str());
-        if outdated_reason.is_none() || outdated_reason == Some("file_not_in_diff") {
-            comment.insert("outdated".to_string(), serde_json::Value::Bool(false));
-            comment.remove("outdated_reason");
-        }
-        changed = true;
-    }
-
-    changed
-        .then(|| serde_json::to_string_pretty(&snapshot).ok())
-        .flatten()
-}
-
-fn review_comment_rename_candidate(file: &str, visible_paths: &[Arc<RelPath>]) -> Option<String> {
-    let old_path = std::path::Path::new(file);
-    let old_parent = old_path.parent();
-    let old_extension = old_path.extension();
-    let old_stem = old_path.file_stem()?.to_str()?;
-    let mut best = None;
-    let mut tied = false;
-
-    for candidate in visible_paths {
-        let candidate = candidate.as_unix_str();
-        if candidate == file {
-            continue;
-        }
-        let candidate_path = std::path::Path::new(candidate);
-        if candidate_path.parent() != old_parent || candidate_path.extension() != old_extension {
-            continue;
-        }
-        let Some(candidate_stem) = candidate_path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        let score = shared_affix_len(old_stem, candidate_stem);
-        let max_len = old_stem.chars().count().max(candidate_stem.chars().count());
-        if score * 3 < max_len {
-            continue;
-        }
-        match best {
-            None => {
-                best = Some((candidate.to_string(), score));
-                tied = false;
-            }
-            Some((_, best_score)) if score > best_score => {
-                best = Some((candidate.to_string(), score));
-                tied = false;
-            }
-            Some((_, best_score)) if score == best_score => tied = true,
-            _ => {}
-        }
-    }
-
-    (!tied).then(|| best.map(|(path, _)| path)).flatten()
-}
-
-fn shared_affix_len(a: &str, b: &str) -> usize {
-    let prefix = a.chars().zip(b.chars()).take_while(|(a, b)| a == b).count();
-    let suffix = a
-        .chars()
-        .rev()
-        .zip(b.chars().rev())
-        .take_while(|(a, b)| a == b)
-        .count();
-
-    (prefix + suffix).min(a.chars().count().min(b.chars().count()))
 }
 
 fn partition_review_comments_json(
@@ -2783,6 +2832,7 @@ fn merge_review_comments_for_save(
             continue;
         };
 
+        preserve_existing_review_round(incoming_comment, &existing_comment);
         merge_review_comment_replies(incoming_comment, existing_comment, &mut next_reply_id);
     }
 
@@ -2791,6 +2841,15 @@ fn merge_review_comments_for_save(
         "comments": incoming_comments,
     })
     .to_string())
+}
+
+fn merge_and_stamp_review_comments_for_save(
+    existing_comments_json: Option<&str>,
+    incoming_comments_json: &str,
+) -> anyhow::Result<(String, u64)> {
+    let merged_comments_json =
+        merge_review_comments_for_save(existing_comments_json, incoming_comments_json)?;
+    stamp_unstamped_review_comments(&merged_comments_json)
 }
 
 fn merge_review_comment_replies(
@@ -2828,6 +2887,8 @@ fn merge_review_comment_replies(
             .find(|reply| reply.get("id").and_then(|id| id.as_i64()) == Some(incoming_id))
         {
             if review_replies_match(existing_reply, &incoming_reply) {
+                let mut incoming_reply = incoming_reply;
+                preserve_existing_review_round(&mut incoming_reply, existing_reply);
                 *existing_reply = incoming_reply;
             } else {
                 let mut incoming_reply = incoming_reply;
@@ -2843,6 +2904,21 @@ fn merge_review_comment_replies(
     }
 
     *incoming_replies = merged_replies;
+}
+
+fn preserve_existing_review_round(
+    incoming_item: &mut serde_json::Value,
+    existing_item: &serde_json::Value,
+) {
+    if incoming_item.get("review_round").is_some() {
+        return;
+    }
+    let Some(review_round) = existing_item.get("review_round").cloned() else {
+        return;
+    };
+    if let Some(incoming_object) = incoming_item.as_object_mut() {
+        incoming_object.insert("review_round".to_string(), review_round);
+    }
 }
 
 fn review_replies_match(left: &serde_json::Value, right: &serde_json::Value) -> bool {
@@ -2876,6 +2952,102 @@ fn review_comments_json_restorable_comment_count(comments_json: &str) -> usize {
                 .count()
         })
         .unwrap_or(0)
+}
+
+fn preserve_live_review_comment_locations(
+    base_comments_json: &str,
+    live_comments_json: &str,
+    incoming_comments_json: &str,
+) -> anyhow::Result<Option<String>> {
+    const LOCATION_FIELDS: [&str; 5] = ["file", "side", "hunk_line", "line_start", "line_end"];
+
+    let base: serde_json::Value =
+        serde_json::from_str(base_comments_json).context("deserializing base review comments")?;
+    let live: serde_json::Value =
+        serde_json::from_str(live_comments_json).context("deserializing live review comments")?;
+    let mut incoming: serde_json::Value = serde_json::from_str(incoming_comments_json)
+        .context("deserializing incoming review comments")?;
+    let unique_ids = |snapshot: &serde_json::Value| {
+        let mut unique = HashSet::default();
+        let mut duplicates = HashSet::default();
+        for id in snapshot
+            .get("comments")
+            .and_then(|comments| comments.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|comment| comment.get("id").and_then(|id| id.as_u64()))
+        {
+            if !unique.insert(id) {
+                duplicates.insert(id);
+            }
+        }
+        unique.retain(|id| !duplicates.contains(id));
+        unique
+    };
+    let base_ids = unique_ids(&base);
+    let live_ids = unique_ids(&live);
+    let incoming_ids = unique_ids(&incoming);
+    let stable_ids = base_ids
+        .intersection(&live_ids)
+        .copied()
+        .filter(|id| incoming_ids.contains(id))
+        .collect::<HashSet<_>>();
+    let locations_by_id = |snapshot: &serde_json::Value| {
+        snapshot
+            .get("comments")
+            .and_then(|comments| comments.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|comment| {
+                let id = comment.get("id")?.as_u64()?;
+                stable_ids
+                    .contains(&id)
+                    .then(|| (id, LOCATION_FIELDS.map(|field| comment.get(field).cloned())))
+            })
+            .collect::<HashMap<_, _>>()
+    };
+    let base_locations = locations_by_id(&base);
+    let live_locations = locations_by_id(&live)
+        .into_iter()
+        .filter(|(id, location)| base_locations.get(id) != Some(location))
+        .collect::<HashMap<_, _>>();
+
+    let mut changed = false;
+    if let Some(comments) = incoming
+        .get_mut("comments")
+        .and_then(|comments| comments.as_array_mut())
+    {
+        for comment in comments {
+            let Some(id) = comment.get("id").and_then(|id| id.as_u64()) else {
+                continue;
+            };
+            let Some(location) = live_locations.get(&id) else {
+                continue;
+            };
+            let Some(comment) = comment.as_object_mut() else {
+                continue;
+            };
+            for (field, value) in LOCATION_FIELDS.into_iter().zip(location) {
+                match value {
+                    Some(value) if comment.get(field) != Some(value) => {
+                        comment.insert(field.to_string(), value.clone());
+                        changed = true;
+                    }
+                    None if comment.remove(field).is_some() => changed = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if changed {
+        Ok(Some(
+            serde_json::to_string_pretty(&incoming)
+                .context("serializing rebased review comments")?,
+        ))
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -3283,6 +3455,7 @@ impl ProjectDiff {
                     let reason = match comment.outdated_reason.as_deref() {
                         Some("file_not_in_diff") => "file no longer has a visible diff",
                         Some("line_not_in_diff") => "line no longer has a visible diff",
+                        Some("line_changed") => "commented text was changed",
                         _ => "change no longer has a visible diff",
                     };
                     let reply_label = match comment.replies.len() {
@@ -3419,14 +3592,16 @@ impl SerializableItem for ProjectDiff {
     }
 }
 
-mod persistence {
+pub(crate) mod persistence {
 
     use anyhow::Context as _;
     use db::{
         sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection},
         sqlez_macros::sql,
     };
-    use project::git_store::branch_diff::DiffBase;
+    use project::git_store::{
+        branch_diff::DiffBase, diff_buffer_list::DiffBase as ProjectDiffBase,
+    };
     use workspace::{ItemId, WorkspaceDb, WorkspaceId};
 
     pub struct ProjectDiffDb(ThreadSafeConnection);
@@ -3564,12 +3739,64 @@ mod persistence {
             Ok((diff_base, follows_default_branch != 0))
         }
 
+        pub fn get_project_diff_base(
+            &self,
+            item_id: ItemId,
+            workspace_id: WorkspaceId,
+        ) -> anyhow::Result<ProjectDiffBase> {
+            let (diff_base, _) = self.get_diff_base(item_id, workspace_id)?;
+            let serialized = serde_json::to_string(&diff_base)?;
+            serde_json::from_str(&serialized).context("converting persisted diff base")
+        }
+
+        pub async fn save_project_diff_base(
+            &self,
+            item_id: ItemId,
+            workspace_id: WorkspaceId,
+            diff_base: ProjectDiffBase,
+        ) -> anyhow::Result<()> {
+            let serialized = serde_json::to_string(&diff_base)?;
+            let diff_base =
+                serde_json::from_str(&serialized).context("converting project diff base")?;
+            self.save_diff_base(item_id, workspace_id, diff_base, false)
+                .await
+        }
+
         pub fn save_review_comments(
             &self,
             workspace_id: WorkspaceId,
             review_key: String,
             comments_json: String,
-        ) -> impl Future<Output = anyhow::Result<()>> + use<> {
+        ) -> impl Future<Output = anyhow::Result<String>> + use<> {
+            let save =
+                self.save_review_comments_inner(workspace_id, review_key, comments_json, false);
+            async move { Ok(save.await?.0) }
+        }
+
+        pub fn save_and_stamp_review_comments(
+            &self,
+            workspace_id: WorkspaceId,
+            review_key: String,
+            comments_json: String,
+        ) -> impl Future<Output = anyhow::Result<(String, u64)>> + use<> {
+            let save =
+                self.save_review_comments_inner(workspace_id, review_key, comments_json, true);
+            async move {
+                let (comments_json, review_round) = save.await?;
+                Ok((
+                    comments_json,
+                    review_round.context("stamped save did not allocate a review round")?,
+                ))
+            }
+        }
+
+        fn save_review_comments_inner(
+            &self,
+            workspace_id: WorkspaceId,
+            review_key: String,
+            comments_json: String,
+            stamp_unstamped: bool,
+        ) -> impl Future<Output = anyhow::Result<(String, Option<u64>)>> + use<> {
             self.write(move |connection| {
                 let select_sql = sql!(
                     SELECT comments_json FROM project_diff_review_comments
@@ -3580,10 +3807,22 @@ mod persistence {
                 let existing_comments_json = select_existing((workspace_id, review_key.clone()))?
                     .into_iter()
                     .next();
-                let comments_json = super::merge_review_comments_for_save(
-                    existing_comments_json.as_deref(),
-                    &comments_json,
-                )?;
+                let (comments_json, review_round) = if stamp_unstamped {
+                    let (comments_json, review_round) =
+                        super::merge_and_stamp_review_comments_for_save(
+                            existing_comments_json.as_deref(),
+                            &comments_json,
+                        )?;
+                    (comments_json, Some(review_round))
+                } else {
+                    (
+                        super::merge_review_comments_for_save(
+                            existing_comments_json.as_deref(),
+                            &comments_json,
+                        )?,
+                        None,
+                    )
+                };
 
                 let sql_stmt = sql!(
                     INSERT INTO project_diff_review_comments(
@@ -3601,7 +3840,40 @@ mod persistence {
                         archive_scope = NULL
                 );
                 let mut query = connection.exec_bound::<(WorkspaceId, String, String)>(sql_stmt)?;
-                query((workspace_id, review_key, comments_json)).context(format!(
+                query((workspace_id, review_key, comments_json.clone())).context(format!(
+                    "exec_bound failed to execute or parse for: {}",
+                    sql_stmt
+                ))?;
+                Ok((comments_json, review_round))
+            })
+        }
+
+        pub fn replace_review_comments_if_unchanged(
+            &self,
+            workspace_id: WorkspaceId,
+            review_key: String,
+            expected_comments_json: String,
+            replacement_comments_json: String,
+        ) -> impl Future<Output = anyhow::Result<()>> + use<> {
+            self.write(move |connection| {
+                let sql_stmt = sql!(
+                    UPDATE project_diff_review_comments
+                    SET comments_json = ?
+                    WHERE workspace_id = ?
+                      AND review_key = ?
+                      AND session_id = "active"
+                      AND archived_on IS NULL
+                      AND comments_json = ?
+                );
+                let mut query =
+                    connection.exec_bound::<(String, WorkspaceId, String, String)>(sql_stmt)?;
+                query((
+                    replacement_comments_json,
+                    workspace_id,
+                    review_key,
+                    expected_comments_json,
+                ))
+                .context(format!(
                     "exec_bound failed to execute or parse for: {}",
                     sql_stmt
                 ))
@@ -3761,6 +4033,19 @@ mod persistence {
         pub async fn insert_test_workspace(&self, workspace_id: WorkspaceId) -> anyhow::Result<()> {
             self.write(move |connection| {
                 let sql_stmt = sql!(INSERT OR IGNORE INTO workspaces(workspace_id) VALUES (?));
+                let mut query = connection.exec_bound::<WorkspaceId>(sql_stmt)?;
+                query(workspace_id).context(format!(
+                    "exec_bound failed to execute or parse for: {}",
+                    sql_stmt
+                ))
+            })
+            .await
+        }
+
+        #[cfg(test)]
+        pub async fn delete_test_workspace(&self, workspace_id: WorkspaceId) -> anyhow::Result<()> {
+            self.write(move |connection| {
+                let sql_stmt = sql!(DELETE FROM workspaces WHERE workspace_id = ?);
                 let mut query = connection.exec_bound::<WorkspaceId>(sql_stmt)?;
                 query(workspace_id).context(format!(
                     "exec_bound failed to execute or parse for: {}",
@@ -4000,7 +4285,7 @@ impl Render for ProjectDiffToolbar {
                             })),
                     ),
             )
-            .child(vertical_divider())
+            .child(Divider::vertical())
             .child(
                 h_group_sm()
                     .when(
@@ -4053,7 +4338,7 @@ impl Render for ProjectDiffToolbar {
                     ),
             )
             .when(review_count > 0, |el| {
-                el.child(vertical_divider()).child(
+                el.child(Divider::vertical()).child(
                     render_send_review_to_agent_button(review_count, &focus_handle).on_click(
                         cx.listener(|this, _, window, cx| {
                             this.dispatch_action(&SendReviewToAgent, window, cx)
@@ -4064,7 +4349,10 @@ impl Render for ProjectDiffToolbar {
     }
 }
 
-fn render_send_review_to_agent_button(review_count: usize, focus_handle: &FocusHandle) -> Button {
+pub(crate) fn render_send_review_to_agent_button(
+    review_count: usize,
+    focus_handle: &FocusHandle,
+) -> Button {
     Button::new("send-review", format!("Copy Cmts ({})", review_count))
         .start_icon(
             Icon::new(IconName::ZedAssistant)
@@ -4316,7 +4604,7 @@ impl Render for BranchDiffToolbar {
                 )
             })
             .when(review_count > 0, |this| {
-                this.child(vertical_divider()).child(
+                this.child(Divider::vertical()).child(
                     render_send_review_to_agent_button(review_count, &focus_handle).on_click(
                         cx.listener(|this, _, window, cx| {
                             this.dispatch_action(&SendReviewToAgent, window, cx)
@@ -4389,6 +4677,203 @@ mod tests {
         });
     }
 
+    fn init_review_db_test(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+    }
+
+    #[test]
+    fn test_external_reply_keeps_current_comment_lines() {
+        let base = serde_json::json!({
+            "schema_version": 1,
+            "comments": [{
+                "id": 0,
+                "author": "vxio",
+                "file": "moved.go",
+                "side": "new",
+                "hunk_line": 4,
+                "line_start": 5,
+                "line_end": 6,
+                "body": "review",
+                "replies": []
+            }]
+        })
+        .to_string();
+        let live = serde_json::json!({
+            "schema_version": 1,
+            "comments": [
+                {
+                    "id": 0,
+                    "author": "vxio",
+                    "file": "moved.go",
+                    "side": "new",
+                    "hunk_line": 9,
+                    "line_start": 10,
+                    "line_end": 11,
+                    "body": "review",
+                    "replies": []
+                },
+                {
+                    "id": 1,
+                    "author": "vxio",
+                    "file": "local.go",
+                    "side": "new",
+                    "hunk_line": 98,
+                    "line_start": 99,
+                    "line_end": 99,
+                    "body": "local collision",
+                    "replies": []
+                }
+            ]
+        })
+        .to_string();
+        let incoming = serde_json::json!({
+            "schema_version": 1,
+            "comments": [
+                {
+                    "id": 0,
+                    "author": "vxio",
+                    "file": "moved.go",
+                    "side": "new",
+                    "hunk_line": 4,
+                    "line_start": 5,
+                    "line_end": 6,
+                    "body": "review",
+                    "resolved_on": "now",
+                    "replies": [{ "id": 1000, "author": "amp", "body": "fixed" }]
+                },
+                {
+                    "id": 1,
+                    "author": "amp",
+                    "file": "new.go",
+                    "side": "new",
+                    "hunk_line": 20,
+                    "line_start": 21,
+                    "line_end": 21,
+                    "body": "external",
+                    "replies": []
+                }
+            ]
+        })
+        .to_string();
+
+        let merged = preserve_live_review_comment_locations(&base, &live, &incoming)
+            .unwrap()
+            .expect("locations should be rebased");
+        let merged: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(merged["comments"][0]["hunk_line"], 9);
+        assert_eq!(merged["comments"][0]["line_start"], 10);
+        assert_eq!(merged["comments"][0]["line_end"], 11);
+        assert_eq!(merged["comments"][0]["resolved_on"], "now");
+        assert_eq!(merged["comments"][0]["replies"][0]["body"], "fixed");
+        assert_eq!(merged["comments"][1]["line_start"], 21);
+    }
+
+    #[test]
+    fn test_external_review_comment_merge_preserves_deletions_and_ambiguous_ids() {
+        let comment = |id, line_start| {
+            serde_json::json!({
+                "id": id,
+                "author": "vxio",
+                "file": "file.go",
+                "side": "new",
+                "hunk_line": line_start - 1,
+                "line_start": line_start,
+                "line_end": line_start,
+                "body": "review",
+                "replies": []
+            })
+        };
+        let base = serde_json::json!({
+            "schema_version": 1,
+            "comments": [comment(0, 5), comment(1, 10), comment(1, 11)]
+        })
+        .to_string();
+        let live = serde_json::json!({
+            "schema_version": 1,
+            "comments": [comment(0, 15), comment(1, 20), comment(1, 21)]
+        })
+        .to_string();
+        let incoming = serde_json::json!({
+            "schema_version": 1,
+            "comments": [comment(1, 30), comment(1, 31)]
+        })
+        .to_string();
+
+        assert_eq!(
+            preserve_live_review_comment_locations(&base, &live, &incoming).unwrap(),
+            None,
+            "an externally deleted comment must not be restored, and duplicate IDs must not be rebased"
+        );
+    }
+
+    #[test]
+    fn test_external_review_comment_merge_only_rebases_locations_changed_locally() {
+        let base = serde_json::json!({
+            "schema_version": 1,
+            "comments": [{
+                "id": 0,
+                "file": "base.go",
+                "side": "new",
+                "hunk_line": 4,
+                "line_start": 5,
+                "line_end": 5
+            }]
+        })
+        .to_string();
+        let incoming = serde_json::json!({
+            "schema_version": 1,
+            "comments": [{
+                "id": 0,
+                "file": "incoming.go",
+                "side": "new",
+                "hunk_line": 8,
+                "line_start": 9,
+                "line_end": 9
+            }]
+        })
+        .to_string();
+
+        assert_eq!(
+            preserve_live_review_comment_locations(&base, &base, &incoming).unwrap(),
+            None,
+            "incoming locations must win when the live anchor did not move"
+        );
+    }
+
+    #[test]
+    fn test_external_review_comment_merge_retries_from_last_raw_observation() {
+        let snapshot = |line_start, body| {
+            serde_json::json!({
+                "schema_version": 1,
+                "comments": [{
+                    "id": 0,
+                    "file": "file.go",
+                    "side": "new",
+                    "hunk_line": line_start - 1,
+                    "line_start": line_start,
+                    "line_end": line_start,
+                    "body": body
+                }]
+            })
+            .to_string()
+        };
+        let last_raw_observation = snapshot(5, "original");
+        let live = snapshot(10, "first external update");
+        let second_external_update = snapshot(5, "second external update");
+
+        let merged = preserve_live_review_comment_locations(
+            &last_raw_observation,
+            &live,
+            &second_external_update,
+        )
+        .unwrap()
+        .expect("the live location should still differ from the raw DB observation");
+        let merged: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(merged["comments"][0]["line_start"], 10);
+        assert_eq!(merged["comments"][0]["body"], "second external update");
+    }
+
     #[test]
     fn test_partition_review_comments_json_by_author() {
         let comments_json = serde_json::json!({
@@ -4450,7 +4935,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_amp_prompt_for_unstamped_review_comments_stamps_in_memory_json() {
+    fn test_stamp_unstamped_review_comments_uses_next_round() {
         let repo = "/project".to_string();
         let review_key = "/project\nbranch:refs/heads/topic\nsince:origin/main".to_string();
         let comments_json = serde_json::json!({
@@ -4462,52 +4947,54 @@ mod tests {
         })
         .to_string();
 
-        let (stamped_json, prompt) =
-            generate_amp_prompt_for_unstamped_review_comments(repo, review_key, comments_json)
-                .unwrap();
+        let (stamped_json, review_round) = stamp_unstamped_review_comments(&comments_json).unwrap();
+        let prompt =
+            amp_prompt_for_review_round(repo, review_key, &stamped_json, review_round).unwrap();
         let stamped: serde_json::Value = serde_json::from_str(&stamped_json).unwrap();
 
         assert_eq!(stamped["comments"][0]["review_round"], 2);
         assert_eq!(stamped["comments"][1]["review_round"], 1);
-        assert!(prompt.contains("Review #2"));
+        assert_eq!(review_round, 2);
         assert!(prompt.contains("do this"));
         assert!(!prompt.contains("\"body\":\"old\""));
     }
 
     #[test]
-    fn test_remap_review_comment_paths_follows_renames() {
+    fn test_prompt_includes_new_user_reply_to_agent_comment() {
         let comments_json = serde_json::json!({
-            "schema_version": 1,
-            "comments": [
-                { "id": 0, "author": "vxio", "file": "pkg/name_latest.go", "side": "new", "hunk_line": 2, "line_start": 1, "line_end": 1, "body": "follow", "outdated": true, "outdated_reason": "file_not_in_diff", "replies": [] },
-                { "id": 1, "author": "vxio", "file": "other.go", "side": "new", "hunk_line": 2, "line_start": 1, "line_end": 1, "body": "stay", "outdated": true, "outdated_reason": "file_not_in_diff", "replies": [] }
-            ]
+            "schema_version": 3,
+            "comments": [{
+                "id": 0,
+                "author": "amp",
+                "review_round": 1,
+                "file": "a.txt",
+                "side": "new",
+                "hunk_line": 1,
+                "line_start": 1,
+                "line_end": 1,
+                "body": "agent finding",
+                "replies": [{ "id": 1000, "author": "vxio", "body": "please revisit" }]
+            }]
         })
         .to_string();
 
-        let remapped = remap_review_comment_paths(
-            &comments_json,
-            &[
-                RelPath::unix("pkg/name_dev.go").unwrap().into_arc(),
-                RelPath::unix("other.go").unwrap().into_arc(),
-            ],
+        let (stamped_json, review_round) = stamp_unstamped_review_comments(&comments_json).unwrap();
+        let prompt = amp_prompt_for_review_round(
+            "/project".to_string(),
+            "/project\nbranch:refs/heads/topic\nsince:origin/main".to_string(),
+            &stamped_json,
+            review_round,
         )
         .unwrap();
-        let remapped: serde_json::Value = serde_json::from_str(&remapped).unwrap();
 
-        assert_eq!(remapped["comments"][0]["file"], "pkg/name_dev.go");
-        assert_eq!(remapped["comments"][0]["outdated"], false);
-        assert!(remapped["comments"][0].get("outdated_reason").is_none());
-        assert_eq!(remapped["comments"][1]["file"], "other.go");
-        assert_eq!(
-            remapped["comments"][1]["outdated_reason"],
-            "file_not_in_diff"
-        );
+        assert_eq!(review_round, 2);
+        assert!(prompt.contains("agent finding"));
+        assert!(prompt.contains("please revisit"));
     }
 
     #[gpui::test]
     async fn test_archive_user_review_comments_clears_visible_diff(cx: &mut TestAppContext) {
-        init_test(cx);
+        init_review_db_test(cx);
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -4589,7 +5076,7 @@ mod tests {
     async fn test_copy_amp_prompt_toolbar_updates_when_review_comments_change(
         cx: &mut TestAppContext,
     ) {
-        init_test(cx);
+        init_review_db_test(cx);
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -4651,7 +5138,7 @@ mod tests {
         let comments_json = serde_json::json!({
             "schema_version": 1,
             "comments": [
-                { "id": 0, "author": "vxio", "file": "foo.txt", "side": "new", "hunk_line": 1, "line_start": 1, "line_end": 1, "body": "first click", "replies": [] }
+                { "id": 0, "author": "vxio", "file": "foo.txt", "side": "new", "hunk_line": 2, "line_start": 1, "line_end": 1, "body": "first click", "replies": [] }
             ]
         })
         .to_string();
@@ -4676,11 +5163,20 @@ mod tests {
             first_mouse: false,
         });
 
+        cx.run_until_parked();
         let clipboard = cx
             .read_from_clipboard()
             .and_then(|item| item.text())
             .unwrap();
         assert!(clipboard.contains("first click"));
+
+        let review_key = diff.read_with(cx, |diff, cx| diff.review_comments_key(cx).unwrap());
+        let persisted = cx
+            .update(|_, cx| persistence::ProjectDiffDb::global(cx))
+            .get_review_comments(workspace_id, &review_key)
+            .unwrap()
+            .unwrap();
+        assert!(persisted.contains("first click"));
         cx.simulate_event(gpui::MouseUpEvent {
             position: button_bounds.center(),
             modifiers: gpui::Modifiers::none(),
@@ -4697,11 +5193,94 @@ mod tests {
         });
         let stamped: serde_json::Value = serde_json::from_str(&stamped).unwrap();
         assert_eq!(stamped["comments"][0]["review_round"], 1);
+
+        let unstamped_comments_json = serde_json::json!({
+            "schema_version": 1,
+            "comments": [
+                { "id": 1, "author": "vxio", "file": "foo.txt", "side": "new", "hunk_line": 2, "line_start": 1, "line_end": 1, "body": "must persist", "replies": [] }
+            ]
+        })
+        .to_string();
+        diff.update_in(cx, |diff, window, cx| {
+            let editor = diff.editor.read(cx).rhs_editor().clone();
+            editor.update(cx, |editor, cx| {
+                editor
+                    .restore_review_comments_json(&unstamped_comments_json, window, cx)
+                    .unwrap();
+            });
+        });
+        cx.update(|_, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string("unchanged".to_string()))
+        });
+        cx.update(|_, cx| persistence::ProjectDiffDb::global(cx))
+            .delete_test_workspace(workspace_id)
+            .await
+            .unwrap();
+
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: button_bounds.center(),
+            modifiers: gpui::Modifiers::none(),
+            button: gpui::MouseButton::Left,
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("unchanged".to_string())
+        );
+        let after_failed_save = diff.read_with(cx, |diff, cx| {
+            diff.editor
+                .read(cx)
+                .rhs_editor()
+                .read(cx)
+                .review_comments_json(cx)
+                .unwrap()
+        });
+        let after_failed_save: serde_json::Value =
+            serde_json::from_str(&after_failed_save).unwrap();
+        assert!(
+            after_failed_save["comments"][0]
+                .get("review_round")
+                .is_none()
+        );
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: button_bounds.center(),
+            modifiers: gpui::Modifiers::none(),
+            button: gpui::MouseButton::Left,
+            click_count: 1,
+        });
+
+        cx.update(|_, cx| persistence::ProjectDiffDb::global(cx))
+            .insert_test_workspace(workspace_id)
+            .await
+            .unwrap();
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: button_bounds.center(),
+            modifiers: gpui::Modifiers::none(),
+            button: gpui::MouseButton::Left,
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+        let retried_prompt = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap();
+        assert!(retried_prompt.contains("must persist"));
+        let persisted_after_retry = cx
+            .update(|_, cx| persistence::ProjectDiffDb::global(cx))
+            .get_review_comments(workspace_id, &review_key)
+            .unwrap()
+            .unwrap();
+        let persisted_after_retry: serde_json::Value =
+            serde_json::from_str(&persisted_after_retry).unwrap();
+        assert_eq!(persisted_after_retry["comments"][0]["review_round"], 1);
     }
 
     #[gpui::test]
     async fn test_restore_latest_review_comments_restores_newest_once(cx: &mut TestAppContext) {
-        init_test(cx);
+        init_review_db_test(cx);
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -4919,6 +5498,98 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_review_comments_for_save_preserves_persisted_rounds() {
+        let existing_json = serde_json::json!({
+            "schema_version": 1,
+            "comments": [{
+                "id": 0,
+                "author": "vxio",
+                "review_round": 2,
+                "file": "foo.txt",
+                "side": "new",
+                "hunk_line": 1,
+                "line_start": 1,
+                "line_end": 1,
+                "body": "review",
+                "replies": [{ "id": 1000, "author": "amp", "review_round": 2, "body": "👍 fixed" }]
+            }]
+        })
+        .to_string();
+        let incoming_json = serde_json::json!({
+            "schema_version": 1,
+            "comments": [{
+                "id": 0,
+                "author": "vxio",
+                "file": "foo.txt",
+                "side": "new",
+                "hunk_line": 1,
+                "line_start": 1,
+                "line_end": 1,
+                "body": "review",
+                "replies": [
+                    { "id": 1000, "author": "amp", "body": "👍 fixed" },
+                    { "id": 1001, "author": "vxio", "body": "one more thing" }
+                ]
+            }]
+        })
+        .to_string();
+
+        let merged = merge_review_comments_for_save(Some(&existing_json), &incoming_json).unwrap();
+        let merged: serde_json::Value = serde_json::from_str(&merged).unwrap();
+
+        assert_eq!(merged["comments"][0]["review_round"], 2);
+        assert_eq!(merged["comments"][0]["replies"][0]["review_round"], 2);
+        assert!(
+            merged["comments"][0]["replies"][1]
+                .get("review_round")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_merge_and_stamp_review_comments_uses_latest_persisted_round() {
+        let existing_json = serde_json::json!({
+            "schema_version": 1,
+            "comments": [{
+                "id": 0,
+                "author": "vxio",
+                "review_round": 3,
+                "file": "existing.txt",
+                "side": "new",
+                "hunk_line": 1,
+                "line_start": 1,
+                "line_end": 1,
+                "body": "already persisted",
+                "replies": []
+            }]
+        })
+        .to_string();
+        let incoming_json = serde_json::json!({
+            "schema_version": 1,
+            "comments": [{
+                "id": 1,
+                "author": "vxio",
+                "file": "new.txt",
+                "side": "new",
+                "hunk_line": 1,
+                "line_start": 1,
+                "line_end": 1,
+                "body": "new review",
+                "replies": []
+            }]
+        })
+        .to_string();
+
+        let (merged, review_round) =
+            merge_and_stamp_review_comments_for_save(Some(&existing_json), &incoming_json).unwrap();
+        let merged: serde_json::Value = serde_json::from_str(&merged).unwrap();
+
+        assert_eq!(review_round, 4);
+        assert_eq!(merged["comments"][0]["review_round"], 4);
+        assert_eq!(merged["comments"][1]["review_round"], 3);
+    }
+
+    #[test]
     fn test_merge_review_comments_for_save_keeps_both_reply_id_collisions() {
         let existing_json = serde_json::json!({
             "schema_version": 1,
@@ -4946,25 +5617,34 @@ mod tests {
                 "line_start": 1,
                 "line_end": 1,
                 "body": "review",
-                "replies": [{ "id": 1000, "author": "vxio", "body": "why didn't you reply?" }]
+                "replies": [{ "id": 1000, "author": "vxio", "review_round": 2, "body": "why didn't you reply?" }]
             }]
         })
         .to_string();
 
         let merged = merge_review_comments_for_save(Some(&existing_json), &incoming_json).unwrap();
-        let merged: serde_json::Value = serde_json::from_str(&merged).unwrap();
-        let replies = merged["comments"][0]["replies"].as_array().unwrap();
+        let prompt = amp_prompt_for_review_round(
+            "/project".to_string(),
+            "/project\nbranch:refs/heads/topic\nsince:origin/main".to_string(),
+            &merged,
+            2,
+        )
+        .unwrap();
+        let merged_value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        let replies = merged_value["comments"][0]["replies"].as_array().unwrap();
 
         assert_eq!(replies.len(), 2);
         assert_eq!(replies[0]["id"], 1000);
         assert_eq!(replies[0]["body"], "👍 fixed");
         assert_eq!(replies[1]["id"], 1001);
         assert_eq!(replies[1]["body"], "why didn't you reply?");
+        assert!(prompt.contains("\"id\":1001"));
+        assert!(prompt.contains("why didn't you reply?"));
     }
 
     #[gpui::test]
     async fn test_review_comments_survive_restore_clear_and_restore(cx: &mut TestAppContext) {
-        init_test(cx);
+        init_review_db_test(cx);
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -5029,16 +5709,17 @@ mod tests {
         let editor = diff.read_with(cx, |diff, cx| diff.editor.read(cx).rhs_editor().clone());
         let restored = editor.read_with(cx, |editor, cx| editor.review_comments_json(cx).unwrap());
         assert!(restored.contains("persist me"));
+        let restored: serde_json::Value = serde_json::from_str(&restored).unwrap();
 
         editor.update(cx, |editor, cx| editor.clear_review_comments(cx));
         cx.run_until_parked();
 
-        assert_eq!(
-            db.get_review_comments(workspace_id, &review_key)
-                .unwrap()
-                .unwrap(),
-            comments_json
-        );
+        let persisted = db
+            .get_review_comments(workspace_id, &review_key)
+            .unwrap()
+            .unwrap();
+        let persisted: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(persisted, restored);
 
         cx.update(|window, cx| {
             diff.update(cx, |diff, cx| {
@@ -5053,7 +5734,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_review_comments_reload_when_persisted_json_changes(cx: &mut TestAppContext) {
-        init_test(cx);
+        init_review_db_test(cx);
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -5146,7 +5827,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_review_comments_reload_waits_for_active_comment_input(cx: &mut TestAppContext) {
-        init_test(cx);
+        init_review_db_test(cx);
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -5210,10 +5891,12 @@ mod tests {
                 diff.restore_review_comments_if_needed(window, cx);
             })
         });
+        let loaded_before_draft =
+            diff.read_with(cx, |diff, _| diff.loaded_review_comments_json.clone());
 
         let editor = diff.read_with(cx, |diff, cx| diff.editor.read(cx).rhs_editor().clone());
         editor.update_in(cx, |editor, window, cx| {
-            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            editor.show_diff_review_overlay(DisplayRow(3)..DisplayRow(3), window, cx);
             let prompt_editor = editor.diff_review_prompt_editor().cloned().unwrap();
             prompt_editor.update(cx, |prompt_editor, cx| {
                 prompt_editor.insert("draft", window, cx);
@@ -5242,10 +5925,7 @@ mod tests {
         cx.update(|window, cx| {
             diff.update(cx, |diff, cx| {
                 diff.restore_review_comments_if_needed(window, cx);
-                assert_eq!(
-                    diff.loaded_review_comments_json.as_deref(),
-                    Some(initial_comments_json.as_str())
-                );
+                assert_eq!(diff.loaded_review_comments_json, loaded_before_draft);
             })
         });
 
@@ -5261,7 +5941,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_review_comments_restore_multiple_locations(cx: &mut TestAppContext) {
-        init_test(cx);
+        init_review_db_test(cx);
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -5347,11 +6027,60 @@ mod tests {
         for body in ["wow", "woah", "dope", "hi", "huh", "??", "weird"] {
             assert!(comments.iter().any(|comment| comment["body"] == body));
         }
+        for (id, file) in [
+            (1, "go.sum"),
+            (2, "go.sum"),
+            (4, "go.sum"),
+            (6, "go.sum"),
+            (3, "go.mod"),
+            (8, "go.mod"),
+            (5, "internal/validator/validate_test.go"),
+            (7, "internal/validator/validate_test.go"),
+        ] {
+            let comment = comments
+                .iter()
+                .find(|comment| comment["id"] == id)
+                .expect("restored comment");
+            assert_eq!(comment["file"], file, "comment {id} changed files");
+        }
+
+        fs.insert_file(
+            path!("/project/go.mod"),
+            b"inserted\nline 1\nline 2 changed\nline 3 changed\nline 4\nline 5\n".to_vec(),
+        )
+        .await;
+        fs.insert_file(
+            path!("/project/internal/validator/validate_test.go"),
+            b"line 1\ninserted\nline 2 changed\nline 3 changed\nline 4\n".to_vec(),
+        )
+        .await;
+        cx.run_until_parked();
+
+        let after_edits =
+            editor.read_with(cx, |editor, cx| editor.review_comments_json(cx).unwrap());
+        let after_edits: serde_json::Value = serde_json::from_str(&after_edits).unwrap();
+        let comments = after_edits["comments"].as_array().unwrap();
+        for (id, file) in [
+            (1, "go.sum"),
+            (2, "go.sum"),
+            (4, "go.sum"),
+            (6, "go.sum"),
+            (3, "go.mod"),
+            (8, "go.mod"),
+            (5, "internal/validator/validate_test.go"),
+            (7, "internal/validator/validate_test.go"),
+        ] {
+            let comment = comments
+                .iter()
+                .find(|comment| comment["id"] == id)
+                .expect("comment after edits");
+            assert_eq!(comment["file"], file, "comment {id} changed files");
+        }
     }
 
     #[gpui::test]
     async fn test_review_comments_keep_unmapped_locations(cx: &mut TestAppContext) {
-        init_test(cx);
+        init_review_db_test(cx);
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -5419,7 +6148,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_review_comments_restore_waits_for_pending_save(cx: &mut TestAppContext) {
-        init_test(cx);
+        init_review_db_test(cx);
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -5480,28 +6209,36 @@ mod tests {
                 diff.restore_review_comments_if_needed(window, cx);
             });
         });
-        let empty_comments_json = serde_json::json!({
+        let deleted_comments_json = serde_json::json!({
             "schema_version": 1,
-            "comments": []
+            "comments": [{
+                "id": 0,
+                "author": "vxio",
+                "file": "foo.txt",
+                "side": "new",
+                "hunk_line": 2,
+                "line_start": 1,
+                "line_end": 1,
+                "body": "delete me",
+                "deleted_on": "2026-07-23 20:00",
+                "replies": []
+            }]
         })
         .to_string();
         cx.update(|_, cx| {
             diff.update(cx, |diff, cx| {
-                diff.persist_review_comments(empty_comments_json, cx);
+                diff.persist_review_comments(deleted_comments_json.clone(), cx);
             })
         });
 
         db.flush_writes().await.unwrap();
-        assert_eq!(
-            db.get_review_comments(workspace_id, &review_key)
-                .unwrap()
-                .unwrap(),
-            serde_json::json!({
-                "schema_version": 1,
-                "comments": []
-            })
-            .to_string()
-        );
+        let persisted = db
+            .get_review_comments(workspace_id, &review_key)
+            .unwrap()
+            .unwrap();
+        let persisted: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(&deleted_comments_json).unwrap();
+        assert_eq!(persisted, expected);
 
         cx.update(|window, cx| {
             diff.update(cx, |diff, cx| {
@@ -5510,14 +6247,12 @@ mod tests {
             });
         });
 
-        let editor = diff.read_with(cx, |diff, cx| diff.editor.read(cx).rhs_editor().clone());
-        let restored = editor.read_with(cx, |editor, cx| editor.review_comments_json(cx).unwrap());
-        assert!(!restored.contains("delete me"));
+        diff.read_with(cx, |diff, _| assert_eq!(diff.review_comment_count, 0));
     }
 
     #[gpui::test]
     async fn test_review_comment_add_persists_and_restores(cx: &mut TestAppContext) {
-        init_test(cx);
+        init_review_db_test(cx);
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -5557,6 +6292,8 @@ mod tests {
         let editor = diff.read_with(cx, |diff, cx| diff.editor.read(cx).rhs_editor().clone());
         editor.update_in(cx, |editor, window, cx| {
             editor.show_diff_review_overlay(DisplayRow(1)..DisplayRow(1), window, cx);
+            assert!(editor.diff_review_prompt_editor().is_none());
+            editor.show_diff_review_overlay(DisplayRow(3)..DisplayRow(3), window, cx);
             let prompt_editor = editor.diff_review_prompt_editor().cloned().unwrap();
             prompt_editor.update(cx, |prompt_editor, cx| {
                 prompt_editor.insert("new comment", window, cx);
@@ -5584,7 +6321,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_review_comment_restores_in_reopened_diff(cx: &mut TestAppContext) {
-        init_test(cx);
+        init_review_db_test(cx);
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -5620,7 +6357,7 @@ mod tests {
 
         let editor = diff.read_with(cx, |diff, cx| diff.editor.read(cx).rhs_editor().clone());
         editor.update_in(cx, |editor, window, cx| {
-            editor.show_diff_review_overlay(DisplayRow(1)..DisplayRow(1), window, cx);
+            editor.show_diff_review_overlay(DisplayRow(3)..DisplayRow(3), window, cx);
             let prompt_editor = editor.diff_review_prompt_editor().cloned().unwrap();
             prompt_editor.update(cx, |prompt_editor, cx| {
                 prompt_editor.insert("reopened comment", window, cx);
@@ -5642,8 +6379,8 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_review_comment_restores_as_outdated_after_diff_removed(cx: &mut TestAppContext) {
-        init_test(cx);
+    async fn test_review_comment_does_not_move_to_similarly_named_file(cx: &mut TestAppContext) {
+        init_review_db_test(cx);
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -5651,12 +6388,16 @@ mod tests {
             json!({
                 ".git": {},
                 "foo.txt": "FOO\n",
+                "foo_test.txt": "TEST\n",
             }),
         )
         .await;
         fs.set_head_and_index_for_repo(
             Path::new(path!("/project/.git")),
-            &[("foo.txt", "foo\n".to_string())],
+            &[
+                ("foo.txt", "foo\n".to_string()),
+                ("foo_test.txt", "test\n".to_string()),
+            ],
         );
 
         let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
@@ -5679,7 +6420,7 @@ mod tests {
 
         let editor = diff.read_with(cx, |diff, cx| diff.editor.read(cx).rhs_editor().clone());
         editor.update_in(cx, |editor, window, cx| {
-            editor.show_diff_review_overlay(DisplayRow(1)..DisplayRow(1), window, cx);
+            editor.show_diff_review_overlay(DisplayRow(3)..DisplayRow(3), window, cx);
             let prompt_editor = editor.diff_review_prompt_editor().cloned().unwrap();
             prompt_editor.update(cx, |prompt_editor, cx| {
                 prompt_editor.insert("removed diff comment", window, cx);
@@ -5688,6 +6429,12 @@ mod tests {
         });
         db.flush_writes().await.unwrap();
         let review_key = diff.read_with(cx, |diff, cx| diff.review_comments_key(cx).unwrap());
+
+        fs.insert_file(path!("/project/foo.txt"), b"foo\n".to_vec())
+            .await;
+        cx.run_until_parked();
+        db.flush_writes().await.unwrap();
+
         let comments_json = db
             .get_review_comments(workspace_id, &review_key)
             .unwrap()
@@ -5700,19 +6447,14 @@ mod tests {
             .await
             .unwrap();
 
-        fs.insert_file(path!("/project/foo.txt"), b"foo\n".to_vec())
-            .await;
-        cx.run_until_parked();
-
-        let reopened_diff = cx.new_window_entity(|window, cx| {
-            ProjectDiff::new(project.clone(), workspace.clone(), window, cx)
+        cx.update(|window, cx| {
+            diff.update(cx, |diff, cx| {
+                diff.restore_review_comments_if_needed(window, cx);
+            })
         });
         cx.run_until_parked();
 
-        let reopened_editor =
-            reopened_diff.read_with(cx, |diff, cx| diff.editor.read(cx).rhs_editor().clone());
-        let restored =
-            reopened_editor.read_with(cx, |editor, cx| editor.review_comments_json(cx).unwrap());
+        let restored = editor.read_with(cx, |editor, cx| editor.review_comments_json(cx).unwrap());
         let restored: serde_json::Value = serde_json::from_str(&restored).unwrap();
         assert_eq!(restored["comments"][0]["body"], "removed diff comment");
         assert_eq!(restored["comments"][0]["outdated"], true);
@@ -5725,10 +6467,10 @@ mod tests {
             "reply on removed diff"
         );
 
-        reopened_diff.read_with(cx, |diff, _cx| {
+        diff.read_with(cx, |diff, _cx| {
             assert_eq!(diff.review_comment_count, 1);
         });
-        reopened_editor.read_with(cx, |editor, _cx| {
+        editor.read_with(cx, |editor, _cx| {
             let orphaned = editor.orphaned_review_comment_summaries();
             assert_eq!(orphaned.len(), 1);
             assert_eq!(orphaned[0].file, "foo.txt");
@@ -5745,7 +6487,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_review_comments_are_scoped_per_diff_view(cx: &mut TestAppContext) {
-        init_test(cx);
+        init_review_db_test(cx);
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -6541,7 +7283,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_sort_by_name_tie_breaks_on_path(cx: &mut TestAppContext) {
-        init_test(cx);
+        init_review_db_test(cx);
 
         cx.update(|cx| {
             cx.update_global::<SettingsStore, _>(|store, cx| {
@@ -6558,7 +7300,7 @@ mod tests {
             path!("/project"),
             json!({
                 ".git": {},
-                "lib": { "foo.rs": "LIB FOO\n" },
+                "foo.rs": { "src": { "foo.rs": "NESTED FOO\n" } },
                 "src": { "foo.rs": "SRC FOO\n" },
                 "m.rs": "M\n",
             }),
@@ -6568,15 +7310,23 @@ mod tests {
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        workspace.update(cx, |workspace, _| workspace.set_random_database_id());
+        let (workspace_id, db) = cx.update(|_, cx| {
+            (
+                workspace.read(cx).database_id().unwrap(),
+                persistence::ProjectDiffDb::global(cx),
+            )
+        });
+        db.insert_test_workspace(workspace_id).await.unwrap();
         let diff = cx.new_window_entity(|window, cx| {
-            ProjectDiff::new(project.clone(), workspace, window, cx)
+            ProjectDiff::new(project.clone(), workspace.clone(), window, cx)
         });
         cx.run_until_parked();
 
         fs.set_head_and_index_for_repo(
             path!("/project/.git").as_ref(),
             &[
-                ("lib/foo.rs", "lib foo\n".into()),
+                ("foo.rs/src/foo.rs", "nested foo\n".into()),
                 ("src/foo.rs", "src foo\n".into()),
                 ("m.rs", "m\n".into()),
             ],
@@ -6584,11 +7334,96 @@ mod tests {
         cx.run_until_parked();
 
         // Sorted by file name, the two `foo.rs` files come before `m.rs`, and the
-        // tie between them is broken by the full path (`lib/` before `src/`).
-        // A plain path sort would instead order them `lib/foo.rs`, `m.rs`,
-        // `src/foo.rs`.
+        // tie between them is broken by the full path.
         let paths = diff.read_with(cx, |diff, cx| diff.excerpt_file_paths(cx));
-        assert_eq!(paths, vec!["lib/foo.rs", "src/foo.rs", "m.rs"]);
+        assert_eq!(paths, vec!["foo.rs/src/foo.rs", "src/foo.rs", "m.rs"]);
+
+        let editor = diff.read_with(cx, |diff, cx| diff.editor.read(cx).rhs_editor().clone());
+        editor.update_in(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(3)..DisplayRow(3), window, cx);
+            let prompt_editor = editor.diff_review_prompt_editor().cloned().unwrap();
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.insert("stable path", window, cx);
+            });
+            editor.submit_diff_review_comment(window, cx);
+        });
+        let comments = editor.read_with(cx, |editor, cx| editor.review_comments_json(cx).unwrap());
+        let comments: serde_json::Value = serde_json::from_str(&comments).unwrap();
+        assert_eq!(comments["schema_version"], 3);
+        assert_eq!(comments["comments"][0]["file"], "foo.rs/src/foo.rs");
+        editor.update_in(cx, |editor, window, cx| {
+            editor
+                .restore_review_comments_json(&comments.to_string(), window, cx)
+                .unwrap();
+        });
+        let restored = editor.read_with(cx, |editor, cx| editor.review_comments_json(cx).unwrap());
+        let restored: serde_json::Value = serde_json::from_str(&restored).unwrap();
+        assert_eq!(restored["comments"][0]["file"], "foo.rs/src/foo.rs");
+
+        let mut legacy_comments = comments.clone();
+        legacy_comments["schema_version"] = serde_json::json!(1);
+        editor.update_in(cx, |editor, window, cx| {
+            assert_eq!(
+                editor
+                    .restore_review_comments_json(&legacy_comments.to_string(), window, cx)
+                    .unwrap(),
+                0
+            );
+            assert_eq!(editor.orphaned_review_comment_summaries().len(), 1);
+            editor
+                .restore_review_comments_json(&comments.to_string(), window, cx)
+                .unwrap();
+        });
+
+        db.flush_writes().await.unwrap();
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git_panel.get_or_insert_default().sort_by = Some(GitPanelSortBy::Path);
+                });
+            });
+        });
+        cx.run_until_parked();
+
+        let restored = editor.read_with(cx, |editor, cx| editor.review_comments_json(cx).unwrap());
+        let restored: serde_json::Value = serde_json::from_str(&restored).unwrap();
+        assert_eq!(restored["comments"][0]["file"], "foo.rs/src/foo.rs");
+        assert_ne!(restored["comments"][0]["outdated"], true, "{restored:#}");
+
+        db.flush_writes().await.unwrap();
+        let review_key = diff.read_with(cx, |diff, cx| diff.review_comments_key(cx).unwrap());
+        let persisted = db
+            .get_review_comments(workspace_id, &review_key)
+            .unwrap()
+            .unwrap();
+        let persisted: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(persisted["schema_version"], 3);
+        assert_eq!(persisted["comments"][0]["file"], "foo.rs/src/foo.rs");
+        assert_ne!(persisted["comments"][0]["outdated"], true);
+
+        let legacy_comments = legacy_comments.to_string();
+        db.save_review_comments(workspace_id, review_key.clone(), legacy_comments)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                diff.update(cx, |diff, cx| {
+                    diff.loaded_review_comments_key = None;
+                    diff.restore_review_comments_if_needed(window, cx);
+                    assert!(!diff.review_comments_fully_restored);
+                })
+            });
+            editor.read_with(cx, |editor, _| {
+                assert_eq!(editor.orphaned_review_comment_summaries().len(), 1);
+            });
+            db.flush_writes().await.unwrap();
+            let persisted = db
+                .get_review_comments(workspace_id, &review_key)
+                .unwrap()
+                .unwrap();
+            let persisted: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+            assert_eq!(persisted["schema_version"], 1);
+        }
     }
 
     #[gpui::test]
@@ -6917,7 +7752,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_project_diff_persistence_keeps_default_branch_tracking(cx: &mut TestAppContext) {
-        init_test(cx);
+        init_review_db_test(cx);
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(path!("/project"), json!({ ".git": {} }))

@@ -2604,6 +2604,12 @@ impl EditorElement {
         if row_info.is_some_and(|row_info| row_info.expand_info.is_some()) {
             return None;
         }
+        if row_info
+            .and_then(|row_info| row_info.diff_status)
+            .is_some_and(|status| status.is_deleted())
+        {
+            return None;
+        }
 
         let buffer_id = row_info.and_then(|info| info.buffer_id)?;
 

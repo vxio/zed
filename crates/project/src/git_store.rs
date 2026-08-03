@@ -1,5 +1,5 @@
-mod conflict_set;
 pub mod branch_diff;
+mod conflict_set;
 pub mod diff_buffer_list;
 pub mod git_traversal;
 pub mod job_debug_queue;
