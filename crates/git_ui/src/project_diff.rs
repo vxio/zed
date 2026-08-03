@@ -83,7 +83,7 @@ actions!(
 );
 
 #[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
-#[action(namespace = git, name = "DiffBranch", deprecated_aliases = ["git::BranchDiff"])]
+#[action(namespace = git, name = "DiffBranch")]
 pub(crate) struct DeployBranchDiff;
 
 struct BufferSubscriptions {
