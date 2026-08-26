@@ -41605,6 +41605,146 @@ fn test_diff_review_overlay_show_and_dismiss(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_diff_review_comment_on_deleted_line(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("one\nthree\n", cx));
+        let multi_buffer = cx.new(|cx| {
+            let mut multi_buffer = MultiBuffer::singleton(buffer.clone(), cx);
+            let diff = cx.new(|cx| {
+                BufferDiff::new_with_base_text(
+                    "one\ntwo\nthree\n",
+                    &buffer.read(cx).text_snapshot(),
+                    cx,
+                )
+            });
+            multi_buffer.add_diff(diff, cx);
+            multi_buffer.set_all_diff_hunks_expanded(cx);
+            multi_buffer
+        });
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+    cx.run_until_parked();
+
+    let comments_json = editor
+        .update(cx, |editor, window, cx| {
+            let display_snapshot = editor.display_snapshot(cx);
+            let deleted_row = display_snapshot
+                .buffer_snapshot()
+                .row_infos(MultiBufferRow::MIN)
+                .find(|row| row.diff_status.is_some_and(|status| status.is_deleted()))
+                .and_then(|row| row.multibuffer_row)
+                .expect("deleted row should be visible");
+            let display_row = display_snapshot
+                .point_to_display_point(Point::new(deleted_row.0, 0), Bias::Left)
+                .row();
+
+            editor.show_diff_review_overlay(display_row..display_row, window, cx);
+            let prompt_editor = editor
+                .diff_review_prompt_editor()
+                .cloned()
+                .expect("deleted line should accept a review comment");
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.insert("why remove this?", window, cx);
+            });
+            editor.submit_diff_review_comment(window, cx);
+            assert!(!editor.refresh_review_comment_outdated_markers(cx));
+            editor.review_comments_json(cx).unwrap()
+        })
+        .unwrap();
+
+    let comments: serde_json::Value = serde_json::from_str(&comments_json).unwrap();
+    assert_eq!(comments["comments"][0]["side"], "old");
+    assert_eq!(comments["comments"][0]["line_start"], 2);
+    assert_eq!(comments["comments"][0]["line_end"], 2);
+
+    editor
+        .update(cx, |editor, window, cx| {
+            let restored = editor
+                .restore_review_comments_json(&comments_json, window, cx)
+                .unwrap();
+            assert_eq!(
+                restored,
+                1,
+                "old-side comment should restore: {:?}",
+                editor.orphaned_review_comment_summaries()
+            );
+            assert!(editor.orphaned_review_comment_summaries().is_empty());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_diff_review_comment_on_deleted_blank_line(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("one\nthree\n", cx));
+        let multi_buffer = cx.new(|cx| {
+            let mut multi_buffer = MultiBuffer::singleton(buffer.clone(), cx);
+            let diff = cx.new(|cx| {
+                BufferDiff::new_with_base_text(
+                    "one\ntwo\n\nthree\n",
+                    &buffer.read(cx).text_snapshot(),
+                    cx,
+                )
+            });
+            multi_buffer.add_diff(diff, cx);
+            multi_buffer.set_all_diff_hunks_expanded(cx);
+            multi_buffer
+        });
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+    cx.run_until_parked();
+
+    let comments_json = editor
+        .update(cx, |editor, window, cx| {
+            let display_snapshot = editor.display_snapshot(cx);
+            let deleted_rows = display_snapshot
+                .buffer_snapshot()
+                .row_infos(MultiBufferRow::MIN)
+                .filter(|row| row.diff_status.is_some_and(|status| status.is_deleted()))
+                .filter_map(|row| row.multibuffer_row)
+                .collect::<Vec<_>>();
+            assert_eq!(deleted_rows.len(), 2);
+            let start_row = display_snapshot
+                .point_to_display_point(Point::new(deleted_rows[0].0, 0), Bias::Left)
+                .row();
+            let end_row = display_snapshot
+                .point_to_display_point(Point::new(deleted_rows[1].0, 0), Bias::Left)
+                .row();
+
+            editor.show_diff_review_overlay(start_row..end_row, window, cx);
+            let prompt_editor = editor
+                .diff_review_prompt_editor()
+                .cloned()
+                .expect("deleted blank line should accept a review comment");
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.insert("why remove this block?", window, cx);
+            });
+            editor.submit_diff_review_comment(window, cx);
+            editor.review_comments_json(cx).unwrap()
+        })
+        .unwrap();
+
+    let comments: serde_json::Value = serde_json::from_str(&comments_json).unwrap();
+    assert_eq!(comments["comments"][0]["side"], "old");
+    assert_eq!(comments["comments"][0]["line_start"], 2);
+    assert_eq!(comments["comments"][0]["line_end"], 3);
+
+    editor
+        .update(cx, |editor, window, cx| {
+            let restored = editor
+                .restore_review_comments_json(&comments_json, window, cx)
+                .unwrap();
+            assert_eq!(restored, 1);
+            assert!(editor.orphaned_review_comment_summaries().is_empty());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn test_diff_review_overlay_dismiss_via_cancel(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

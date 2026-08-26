@@ -24,8 +24,8 @@ use git::{
 };
 use gpui::{
     Action, AnyElement, App, AppContext as _, AsyncWindowContext, ClipboardItem, Entity,
-    EventEmitter, FocusHandle, Focusable, PromptLevel, Render, Subscription, Task, WeakEntity,
-    actions,
+    EventEmitter, FocusHandle, Focusable, PromptLevel, Render, StatefulInteractiveElement,
+    Subscription, Task, WeakEntity, actions,
 };
 use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt};
 use multi_buffer::{MultiBuffer, PathKey};
@@ -137,6 +137,8 @@ pub struct ProjectDiff {
     review_comments_fully_restored: bool,
     copy_amp_prompt_in_progress: bool,
     orphaned_review_comments_expanded: bool,
+    orphaned_review_reply_editors: HashMap<usize, Entity<Editor>>,
+    orphaned_review_reply_subscriptions: HashMap<usize, Subscription>,
     follows_default_branch: bool,
     _task: Task<Result<()>>,
     _review_comments_poll_task: Task<()>,
@@ -1714,6 +1716,8 @@ impl ProjectDiff {
             review_comments_fully_restored: true,
             copy_amp_prompt_in_progress: false,
             orphaned_review_comments_expanded: false,
+            orphaned_review_reply_editors: HashMap::default(),
+            orphaned_review_reply_subscriptions: HashMap::default(),
             follows_default_branch,
             _task: task,
             _review_comments_poll_task: review_comments_poll_task,
@@ -2429,6 +2433,12 @@ fn compact_review_comment_for_prompt(comment: &serde_json::Value) -> serde_json:
     compact.insert("path".to_string(), comment["file"].clone());
     compact.insert("line".to_string(), comment["line_start"].clone());
     compact.insert("body".to_string(), comment["body"].clone());
+    if comment.get("side").and_then(|side| side.as_str()) == Some("old") {
+        compact.insert(
+            "side".to_string(),
+            serde_json::Value::String("old".to_string()),
+        );
+    }
     if let Some(created_at) = comment.get("created_at") {
         compact.insert("at".to_string(), created_at.clone());
     }
@@ -2944,10 +2954,12 @@ fn review_comments_json_restorable_comment_count(comments_json: &str) -> usize {
             comments
                 .iter()
                 .filter(|comment| {
-                    comment.get("side").and_then(|side| side.as_str()) == Some("new")
-                        && comment
-                            .get("deleted_on")
-                            .is_none_or(|deleted_on| deleted_on.is_null())
+                    matches!(
+                        comment.get("side").and_then(|side| side.as_str()),
+                        Some("new" | "old")
+                    ) && comment
+                        .get("deleted_on")
+                        .is_none_or(|deleted_on| deleted_on.is_null())
                 })
                 .count()
         })
@@ -3267,8 +3279,107 @@ impl Item for ProjectDiff {
     }
 }
 
+impl ProjectDiff {
+    fn open_orphaned_review_reply(
+        &mut self,
+        comment_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(reply_editor) = self.orphaned_review_reply_editors.get(&comment_id) {
+            window.focus(&reply_editor.focus_handle(cx), cx);
+            return;
+        }
+
+        let reply_editor = cx.new(|cx| {
+            let mut editor = Editor::auto_height(1, 6, window, cx);
+            editor.set_placeholder_text("Reply...", window, cx);
+            editor.set_use_modal_editing(false);
+            editor.set_show_indent_guides(false, cx);
+            editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
+            editor
+        });
+        let this = cx.weak_entity();
+        let action_subscriptions = reply_editor.update(cx, |reply_editor, _cx| {
+            let submit_subscription = reply_editor.register_action({
+                let this = this.clone();
+                move |_: &menu::Confirm, window, cx| {
+                    this.update(cx, |this, cx| {
+                        this.submit_orphaned_review_reply(comment_id, window, cx);
+                    })
+                    .log_err();
+                }
+            });
+            let cancel_subscription = reply_editor.register_action({
+                let this = this.clone();
+                move |_: &editor::actions::Cancel, _window, cx| {
+                    this.update(cx, |this, cx| {
+                        this.cancel_orphaned_review_reply(comment_id, cx);
+                    })
+                    .log_err();
+                }
+            });
+            Subscription::join(submit_subscription, cancel_subscription)
+        });
+        let focus_handle = reply_editor.focus_handle(cx);
+        let enter_subscription = cx.intercept_keystrokes({
+            let this = this.clone();
+            move |event, window, cx| {
+                if event.keystroke.key == "enter"
+                    && !event.keystroke.modifiers.modified()
+                    && focus_handle.contains_focused(window, cx)
+                {
+                    this.update(cx, |this, cx| {
+                        this.submit_orphaned_review_reply(comment_id, window, cx);
+                    })
+                    .log_err();
+                    cx.stop_propagation();
+                }
+            }
+        });
+
+        self.orphaned_review_reply_editors
+            .insert(comment_id, reply_editor.clone());
+        self.orphaned_review_reply_subscriptions.insert(
+            comment_id,
+            Subscription::join(action_subscriptions, enter_subscription),
+        );
+        window.focus(&reply_editor.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn submit_orphaned_review_reply(
+        &mut self,
+        comment_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let reply = self
+            .orphaned_review_reply_editors
+            .get(&comment_id)
+            .map(|editor| editor.read(cx).text(cx).trim().to_string());
+        self.cancel_orphaned_review_reply(comment_id, cx);
+
+        let Some(reply) = reply.filter(|reply| !reply.is_empty()) else {
+            return;
+        };
+        let editor = self.editor.read(cx).rhs_editor().clone();
+        window.defer(cx, move |_window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.add_orphaned_review_reply(comment_id, reply, cx);
+            });
+        });
+    }
+
+    fn cancel_orphaned_review_reply(&mut self, comment_id: usize, cx: &mut Context<Self>) {
+        self.orphaned_review_reply_editors.remove(&comment_id);
+        self.orphaned_review_reply_subscriptions.remove(&comment_id);
+        cx.notify();
+    }
+}
+
 impl Render for ProjectDiff {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_empty = self.multibuffer.read(cx).is_empty();
         let is_loading = self.branch_diff.read(cx).is_tree_base_loading() || !self._task.is_ready();
         let orphaned_review_comments = self
@@ -3277,6 +3388,16 @@ impl Render for ProjectDiff {
             .rhs_editor()
             .read(cx)
             .orphaned_review_comment_summaries();
+        let orphaned_comment_ids = orphaned_review_comments
+            .iter()
+            .map(|comment| comment.id)
+            .collect::<HashSet<_>>();
+        self.orphaned_review_reply_editors
+            .retain(|comment_id, _| orphaned_comment_ids.contains(comment_id));
+        self.orphaned_review_reply_subscriptions
+            .retain(|comment_id, _| orphaned_comment_ids.contains(comment_id));
+        let orphaned_review_reply_editors = self.orphaned_review_reply_editors.clone();
+        let orphaned_review_comments_max_height = vh(0.65, window);
 
         let is_branch_diff_view = matches!(self.diff_base(cx), DiffBase::Merge { .. });
 
@@ -3320,6 +3441,8 @@ impl Render for ProjectDiff {
                             el.child(Self::render_orphaned_review_comments(
                                 orphaned_review_comments.clone(),
                                 self.orphaned_review_comments_expanded,
+                                orphaned_review_reply_editors.clone(),
+                                orphaned_review_comments_max_height,
                                 cx.weak_entity(),
                                 cx,
                             ))
@@ -3373,6 +3496,8 @@ impl Render for ProjectDiff {
                             el.child(Self::render_orphaned_review_comments(
                                 orphaned_review_comments,
                                 self.orphaned_review_comments_expanded,
+                                orphaned_review_reply_editors,
+                                orphaned_review_comments_max_height,
                                 cx.weak_entity(),
                                 cx,
                             ))
@@ -3387,6 +3512,8 @@ impl ProjectDiff {
     fn render_orphaned_review_comments(
         comments: Vec<OrphanedReviewCommentSummary>,
         expanded: bool,
+        reply_editors: HashMap<usize, Entity<Editor>>,
+        max_height: gpui::Length,
         this: WeakEntity<ProjectDiff>,
         cx: &App,
     ) -> AnyElement {
@@ -3413,13 +3540,16 @@ impl ProjectDiff {
                     .cursor_pointer()
                     .gap_2()
                     .items_center()
-                    .on_click(move |_, _window, cx| {
-                        this.update(cx, |this, cx| {
-                            this.orphaned_review_comments_expanded =
-                                !this.orphaned_review_comments_expanded;
-                            cx.notify();
-                        })
-                        .log_err();
+                    .on_click({
+                        let this = this.clone();
+                        move |_, _window, cx| {
+                            this.update(cx, |this, cx| {
+                                this.orphaned_review_comments_expanded =
+                                    !this.orphaned_review_comments_expanded;
+                                cx.notify();
+                            })
+                            .log_err();
+                        }
                     })
                     .child(
                         Icon::new(if expanded {
@@ -3438,80 +3568,288 @@ impl ProjectDiff {
                     .child(Label::new(title).size(LabelSize::Small).color(Color::Muted)),
             )
             .when(expanded, |el| {
-                let mut list = v_flex().w_full().gap_1().max_h_32();
-                gpui::InteractiveElement::interactivity(&mut list)
-                    .base_style
-                    .overflow
-                    .y = Some(gpui::Overflow::Scroll);
-                el.child(list.children(comments.into_iter().map(|comment| {
-                    let line = if comment.line_start == comment.line_end {
-                        format!("{}:{}", comment.file, comment.line_start)
-                    } else {
-                        format!(
-                            "{}:{}-{}",
-                            comment.file, comment.line_start, comment.line_end
-                        )
-                    };
-                    let reason = match comment.outdated_reason.as_deref() {
-                        Some("file_not_in_diff") => "file no longer has a visible diff",
-                        Some("line_not_in_diff") => "line no longer has a visible diff",
-                        Some("line_changed") => "commented text was changed",
-                        _ => "change no longer has a visible diff",
-                    };
-                    let reply_label = match comment.replies.len() {
-                        0 => None,
-                        1 => Some("1 reply".to_string()),
-                        count => Some(format!("{count} replies")),
-                    };
-
+                el.child(
                     v_flex()
+                        .id("orphaned-review-comments-list")
                         .w_full()
-                        .min_w_0()
-                        .gap_0p5()
-                        .px_2()
-                        .py_1p5()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(colors.border_variant)
-                        .bg(colors.element_background)
-                        .child(
-                            h_flex()
-                                .gap_1p5()
-                                .items_center()
-                                .child(Label::new(line).size(LabelSize::Small).color(Color::Muted))
-                                .child(
-                                    Label::new("Outdated")
-                                        .size(LabelSize::Small)
-                                        .color(Color::Warning),
+                        .gap_1()
+                        .max_h(max_height)
+                        .overflow_y_scroll()
+                        .children(comments.into_iter().map(|comment| {
+                            let comment_id = comment.id;
+                            let line = if comment.line_start == comment.line_end {
+                                format!("{}:{}", comment.file, comment.line_start)
+                            } else {
+                                format!(
+                                    "{}:{}-{}",
+                                    comment.file, comment.line_start, comment.line_end
                                 )
-                                .child(
-                                    Label::new(reason)
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                )
-                                .when_some(reply_label, |el, reply_label| {
-                                    el.child(
-                                        Label::new(reply_label)
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    )
-                                }),
-                        )
-                        .child(Label::new(comment.body).size(LabelSize::Small))
-                        .children(comment.replies.into_iter().map(|reply| {
+                            };
+                            let reason = match comment.outdated_reason.as_deref() {
+                                Some("file_not_in_diff") => "file no longer has a visible diff",
+                                Some("line_not_in_diff") => "line no longer has a visible diff",
+                                Some("line_changed") => "commented text was changed",
+                                _ => "change no longer has a visible diff",
+                            };
+                            let reply_label = match comment.replies.len() {
+                                0 => None,
+                                1 => Some("1 reply".to_string()),
+                                count => Some(format!("{count} replies")),
+                            };
+                            let reply_editor = reply_editors.get(&comment_id).cloned();
+                            let reply_button_id = format!("outdated-review-reply-{comment_id}");
+                            let reply_button_debug_selector = reply_button_id.clone();
+                            let reply_this = this.clone();
+
                             v_flex()
-                                .ml_4()
+                                .id(format!("outdated-review-thread-{comment_id}"))
+                                .w_full()
                                 .min_w_0()
-                                .gap_0p5()
+                                .gap_1()
+                                .px_2()
+                                .py_1p5()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(colors.border_variant)
+                                .bg(colors.element_background)
                                 .child(
-                                    Label::new(reply.author)
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
+                                    h_flex()
+                                        .w_full()
+                                        .min_w_0()
+                                        .flex_wrap()
+                                        .gap_1p5()
+                                        .items_center()
+                                        .child(
+                                            Label::new(line)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(
+                                            Label::new("Outdated")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Warning),
+                                        )
+                                        .child(
+                                            Label::new(reason)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                        .when_some(reply_label, |el, reply_label| {
+                                            el.child(
+                                                Label::new(reply_label)
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            )
+                                        }),
                                 )
-                                .child(Label::new(reply.body).size(LabelSize::Small))
-                        }))
-                })))
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .min_w_0()
+                                        .gap_1p5()
+                                        .items_center()
+                                        .child(
+                                            Label::new(comment.author)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                        .when_some(comment.review_round, |el, round| {
+                                            el.child(
+                                                Label::new(format!("Review #{round}"))
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            )
+                                        })
+                                        .when_some(comment.created_at, |el, created_at| {
+                                            el.child(
+                                                Label::new(created_at)
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            )
+                                        })
+                                        .child(div().flex_1())
+                                        .child(
+                                            div()
+                                                .id(reply_button_id)
+                                                .debug_selector(move || reply_button_debug_selector)
+                                                .child(
+                                                    Button::new(
+                                                        format!(
+                                                            "outdated-review-reply-button-{comment_id}"
+                                                        ),
+                                                        "Reply",
+                                                    )
+                                                    .label_size(LabelSize::Small)
+                                                    .start_icon(
+                                                        Icon::new(IconName::ReplyArrowRight)
+                                                            .size(IconSize::Small),
+                                                    )
+                                                    .tooltip(Tooltip::text("Reply"))
+                                                    .on_click(move |_, window, cx| {
+                                                        reply_this
+                                                            .update(cx, |this, cx| {
+                                                                this.open_orphaned_review_reply(
+                                                                    comment_id, window, cx,
+                                                                );
+                                                            })
+                                                            .log_err();
+                                                    }),
+                                                ),
+                                        ),
+                                )
+                                .child(Self::render_orphaned_review_body(comment.body, colors))
+                                .children(comment.replies.into_iter().map(|reply| {
+                                    v_flex()
+                                        .ml_4()
+                                        .min_w_0()
+                                        .gap_1()
+                                        .px_2()
+                                        .py_1p5()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(colors.border_variant)
+                                        .bg(colors.surface_background)
+                                        .child(
+                                            h_flex()
+                                                .w_full()
+                                                .min_w_0()
+                                                .gap_1p5()
+                                                .items_center()
+                                                .child(
+                                                    Label::new(reply.author)
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Muted),
+                                                )
+                                                .when_some(reply.review_round, |el, round| {
+                                                    el.child(
+                                                        Label::new(format!("Review #{round}"))
+                                                            .size(LabelSize::Small)
+                                                            .color(Color::Muted),
+                                                    )
+                                                })
+                                                .when_some(reply.created_at, |el, created_at| {
+                                                    el.child(
+                                                        Label::new(created_at)
+                                                            .size(LabelSize::Small)
+                                                            .color(Color::Muted),
+                                                    )
+                                                }),
+                                        )
+                                        .child(Self::render_orphaned_review_body(
+                                            reply.body, colors,
+                                        ))
+                                }))
+                                .when_some(reply_editor, |el, reply_editor| {
+                                    let cancel_this = this.clone();
+                                    let submit_this = this.clone();
+                                    let cancel_id =
+                                        format!("outdated-review-cancel-reply-{comment_id}");
+                                    let submit_id =
+                                        format!("outdated-review-submit-reply-{comment_id}");
+                                    let submit_debug_selector = submit_id.clone();
+                                    el.child(
+                                        h_flex()
+                                            .ml_4()
+                                            .min_w_0()
+                                            .items_start()
+                                            .gap_2()
+                                            .px_2()
+                                            .py_1p5()
+                                            .rounded_md()
+                                            .bg(colors.surface_background)
+                                            .child(
+                                                Label::new("vxio")
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .flex_1()
+                                                    .border_1()
+                                                    .border_color(colors.border)
+                                                    .rounded_md()
+                                                    .bg(colors.editor_background)
+                                                    .px_2()
+                                                    .py_1()
+                                                    .child(reply_editor),
+                                            )
+                                            .child(
+                                                h_flex()
+                                                    .flex_shrink_0()
+                                                    .gap_1()
+                                                    .child(
+                                                        Button::new(cancel_id, "Cancel")
+                                                        .label_size(LabelSize::Small)
+                                                        .tooltip(Tooltip::text("Cancel"))
+                                                        .on_click(move |_, _window, cx| {
+                                                            cancel_this
+                                                                .update(cx, |this, cx| {
+                                                                    this.cancel_orphaned_review_reply(
+                                                                        comment_id, cx,
+                                                                    );
+                                                                })
+                                                                .log_err();
+                                                        }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id(submit_id.clone())
+                                                            .debug_selector(move || {
+                                                                submit_debug_selector
+                                                            })
+                                                            .child(
+                                                                Button::new(
+                                                                    format!(
+                                                                        "{submit_id}-button"
+                                                                    ),
+                                                                    "Reply",
+                                                                )
+                                                                .label_size(LabelSize::Small)
+                                                                .tooltip(Tooltip::text(
+                                                                    "Add reply",
+                                                                ))
+                                                                .on_click(
+                                                                    move |_, window, cx| {
+                                                                        submit_this
+                                                                            .update(
+                                                                                cx,
+                                                                                |this, cx| {
+                                                                                    this.submit_orphaned_review_reply(
+                                                                                        comment_id,
+                                                                                        window,
+                                                                                        cx,
+                                                                                    );
+                                                                                },
+                                                                            )
+                                                                            .log_err();
+                                                                    },
+                                                                ),
+                                                            ),
+                                                    ),
+                                            ),
+                                    )
+                                })
+                        })),
+                )
             })
+            .into_any_element()
+    }
+
+    fn render_orphaned_review_body(body: String, colors: &theme::ThemeColors) -> AnyElement {
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_0p5()
+            .children(body.split('\n').map(|line| {
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .text_sm()
+                    .text_color(colors.text)
+                    .whitespace_normal()
+                    .child(if line.is_empty() { " " } else { line }.to_string())
+            }))
             .into_any_element()
     }
 }
@@ -4680,6 +5018,23 @@ mod tests {
     fn init_review_db_test(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+    }
+
+    #[test]
+    fn test_compact_review_comment_preserves_old_side() {
+        let comment = serde_json::json!({
+            "id": 1,
+            "author": "vxio",
+            "file": "src/main.rs",
+            "side": "old",
+            "line_start": 4,
+            "line_end": 4,
+            "body": "Why remove this?"
+        });
+
+        let compact = compact_review_comment_for_prompt(&comment);
+
+        assert_eq!(compact["side"], "old");
     }
 
     #[test]
@@ -6120,7 +6475,7 @@ mod tests {
             "schema_version": 1,
             "comments": [
                 { "id": 0, "author": "vxio", "file": "foo.txt", "side": "new", "hunk_line": 2, "line_start": 1, "line_end": 1, "body": "restores first", "replies": [] },
-                { "id": 1, "author": "vxio", "file": "bar.txt", "side": "new", "hunk_line": 5, "line_start": 1, "line_end": 1, "body": "restores later", "replies": [] }
+                { "id": 1, "author": "vxio", "file": "bar.txt", "side": "old", "hunk_line": 5, "line_start": 1, "line_end": 1, "body": "restores later", "replies": [] }
             ]
         })
         .to_string();
@@ -6291,8 +6646,6 @@ mod tests {
 
         let editor = diff.read_with(cx, |diff, cx| diff.editor.read(cx).rhs_editor().clone());
         editor.update_in(cx, |editor, window, cx| {
-            editor.show_diff_review_overlay(DisplayRow(1)..DisplayRow(1), window, cx);
-            assert!(editor.diff_review_prompt_editor().is_none());
             editor.show_diff_review_overlay(DisplayRow(3)..DisplayRow(3), window, cx);
             let prompt_editor = editor.diff_review_prompt_editor().cloned().unwrap();
             prompt_editor.update(cx, |prompt_editor, cx| {
@@ -6379,7 +6732,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_review_comment_does_not_move_to_similarly_named_file(cx: &mut TestAppContext) {
+    async fn test_outdated_review_comment_preserves_location_and_accepts_reply(
+        cx: &mut TestAppContext,
+    ) {
         init_review_db_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -6443,7 +6798,7 @@ mod tests {
         comments["comments"][0]["replies"] = serde_json::json!([
             { "id": 1000, "author": "amp", "body": "reply on removed diff" }
         ]);
-        db.save_review_comments(workspace_id, review_key, comments.to_string())
+        db.save_review_comments(workspace_id, review_key.clone(), comments.to_string())
             .await
             .unwrap();
 
@@ -6483,6 +6838,53 @@ mod tests {
                 Some("file_not_in_diff")
             );
         });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(diff.clone()), None, true, window, cx);
+        });
+        diff.update(cx, |diff, cx| {
+            diff.orphaned_review_comments_expanded = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let reply_button = cx
+            .debug_bounds("outdated-review-reply-0")
+            .expect("outdated review threads should expose a Reply control");
+        cx.simulate_click(reply_button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let reply_editor = diff
+            .read_with(cx, |diff, _| {
+                diff.orphaned_review_reply_editors.get(&0).cloned()
+            })
+            .expect("Reply should open an editor");
+        reply_editor.update_in(cx, |reply_editor, window, cx| {
+            reply_editor.insert("follow-up on outdated thread", window, cx);
+        });
+
+        let submit_button = cx
+            .debug_bounds("outdated-review-submit-reply-0")
+            .expect("outdated reply editor should expose a submit control");
+        cx.simulate_click(submit_button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        db.flush_writes().await.unwrap();
+
+        let restored = editor.read_with(cx, |editor, cx| editor.review_comments_json(cx).unwrap());
+        let restored: serde_json::Value = serde_json::from_str(&restored).unwrap();
+        assert_eq!(
+            restored["comments"][0]["replies"][1]["body"],
+            "follow-up on outdated thread"
+        );
+        let persisted = db
+            .get_review_comments(workspace_id, &review_key)
+            .unwrap()
+            .unwrap();
+        let persisted: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(
+            persisted["comments"][0]["replies"][1]["body"],
+            "follow-up on outdated thread"
+        );
     }
 
     #[gpui::test]

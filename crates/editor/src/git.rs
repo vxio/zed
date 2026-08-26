@@ -370,6 +370,9 @@ pub(super) struct StoredReviewReply {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrphanedReviewCommentSummary {
     pub id: usize,
+    pub author: String,
+    pub created_at: Option<String>,
+    pub review_round: Option<u32>,
     pub file: String,
     pub line_start: u32,
     pub line_end: u32,
@@ -381,6 +384,8 @@ pub struct OrphanedReviewCommentSummary {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrphanedReviewReplySummary {
     pub author: String,
+    pub created_at: Option<String>,
+    pub review_round: Option<u32>,
     pub body: String,
 }
 
@@ -1541,6 +1546,7 @@ fn mention_link_for_symbol(
 /// Represents an active diff review overlay that appears when clicking the "Add Review" button.
 pub(super) struct DiffReviewOverlay {
     pub(super) anchor_range: Range<Anchor>,
+    location: Option<ReviewCommentLocation>,
     pub(super) block_id: CustomBlockId,
     pub(super) prompt_editor: Entity<Editor>,
     pub(super) hunk_key: DiffHunkKey,
@@ -2256,35 +2262,49 @@ impl Editor {
         );
         let line_start = Point::new(start_point.row, 0);
         let source_range_is_empty = line_start == line_end;
-        let source_ranges = buffer_snapshot
-            .range_to_buffer_ranges(line_start..line_end)
-            .into_iter()
-            .filter(|(_, range, _)| source_range_is_empty || !range.is_empty())
-            .collect::<Vec<_>>();
-        let includes_deleted_text = buffer_snapshot
+        let mut source_ranges = buffer_snapshot
             .range_to_buffer_ranges_with_deleted_hunks(line_start..line_end)
-            .any(|(_, range, deleted_hunk_anchor)| {
-                deleted_hunk_anchor.is_some() && !range.is_empty()
-            });
-        if source_ranges.len() != 1 || includes_deleted_text {
+            .filter(|(_, range, _)| source_range_is_empty || !range.is_empty());
+        let Some((source_snapshot, source_range, deleted_hunk_anchor)) = source_ranges.next()
+        else {
+            return;
+        };
+        if source_ranges.next().is_some() {
             return;
         }
-        let anchor_range =
-            buffer_snapshot.anchor_after(line_start)..buffer_snapshot.anchor_before(line_end);
+        let anchor_range = if let Some(deleted_hunk_anchor) = deleted_hunk_anchor {
+            deleted_hunk_anchor
+                .with_diff_base_anchor(source_snapshot.anchor_after(source_range.start))
+                ..deleted_hunk_anchor
+                    .with_diff_base_anchor(source_snapshot.anchor_before(source_range.end))
+        } else {
+            buffer_snapshot.anchor_after(line_start)..buffer_snapshot.anchor_before(line_end)
+        };
 
         // Compute the hunk key for this display row
-        let file_path = buffer_snapshot
-            .diff_hunks_in_range(start_point..line_end)
-            .next()
-            .and_then(|hunk| {
+        let file_path = source_snapshot
+            .file()
+            .map(|file| file.path().clone())
+            .or_else(|| {
                 buffer_snapshot
                     .buffers_with_paths()
-                    .find(|(snapshot, _)| snapshot.remote_id() == hunk.buffer_id)
-                    .map(|(snapshot, path_key)| {
-                        snapshot
-                            .file()
-                            .map(|file| file.path().clone())
-                            .unwrap_or_else(|| path_key.path.clone())
+                    .find(|(snapshot, _)| snapshot.remote_id() == source_snapshot.remote_id())
+                    .map(|(_, path_key)| path_key.path.clone())
+            })
+            .or_else(|| {
+                buffer_snapshot
+                    .diff_hunks_in_range(start_point..line_end)
+                    .next()
+                    .and_then(|hunk| {
+                        buffer_snapshot
+                            .buffers_with_paths()
+                            .find(|(snapshot, _)| snapshot.remote_id() == hunk.buffer_id)
+                            .map(|(snapshot, path_key)| {
+                                snapshot
+                                    .file()
+                                    .map(|file| file.path().clone())
+                                    .unwrap_or_else(|| path_key.path.clone())
+                            })
                     })
             })
             .or_else(|| {
@@ -2313,6 +2333,27 @@ impl Editor {
                     .map(|file: &Arc<dyn language::File>| file.path().clone())
             })
             .unwrap_or_else(|| Arc::from(util::rel_path::RelPath::empty()));
+        let location = deleted_hunk_anchor.map(|_| {
+            let start_line = source_snapshot.offset_to_point(source_range.start.0).row + 1;
+            let end_point = source_snapshot.offset_to_point(source_range.end.0);
+            let end_line = if end_point.column == 0 {
+                end_point.row + 1
+            } else {
+                let end_offset = source_range
+                    .end
+                    .0
+                    .saturating_sub(1)
+                    .max(source_range.start.0);
+                source_snapshot.offset_to_point(end_offset).row + 1
+            };
+            ReviewCommentLocation {
+                file: file_path.as_unix_str().to_string(),
+                side: "old".to_string(),
+                hunk_line: start_line,
+                line_start: start_line,
+                line_end: end_line,
+            }
+        });
         let hunk_start_anchor = buffer_snapshot.anchor_before(start_point);
         let new_hunk_key = DiffHunkKey {
             file_path,
@@ -2442,6 +2483,7 @@ impl Editor {
 
         self.diff_review_overlays.push(DiffReviewOverlay {
             anchor_range,
+            location,
             block_id,
             prompt_editor: prompt_editor.clone(),
             hunk_key: hunk_key.clone(),
@@ -2513,10 +2555,17 @@ impl Editor {
         let anchor_range = self.diff_review_overlays[overlay_index]
             .anchor_range
             .clone();
+        let location = self.diff_review_overlays[overlay_index].location.clone();
         let hunk_key = self.diff_review_overlays[overlay_index].hunk_key.clone();
         let agent_feedback = self.diff_review_overlays[overlay_index].prompt_agent_feedback;
 
-        let id = self.add_review_comment(hunk_key.clone(), comment_text, anchor_range, cx);
+        let id = self.add_review_comment_at_location(
+            hunk_key.clone(),
+            comment_text,
+            anchor_range,
+            location,
+            cx,
+        );
         if agent_feedback {
             if let Some(comment) = self.stored_review_comment_mut(id) {
                 comment.agent_feedback = true;
@@ -2700,8 +2749,7 @@ impl Editor {
         let end = range.end.to_point(snapshot);
         let range_is_empty = start == end;
         let mut buffer_ranges = snapshot
-            .range_to_buffer_ranges(start..end)
-            .into_iter()
+            .range_to_buffer_ranges_with_deleted_hunks(start..end)
             .filter(|(_, range, _)| range_is_empty || !range.is_empty());
         let (buffer_snapshot, buffer_range, _) = buffer_ranges.next()?;
         if buffer_ranges.next().is_some() {
@@ -2713,6 +2761,7 @@ impl Editor {
         Some(format!("{:x}", Sha256::digest(text.as_bytes())))
     }
 
+    #[cfg(test)]
     pub(super) fn add_review_comment(
         &mut self,
         hunk_key: DiffHunkKey,
@@ -2720,11 +2769,23 @@ impl Editor {
         anchor_range: Range<Anchor>,
         cx: &mut Context<Self>,
     ) -> usize {
+        self.add_review_comment_at_location(hunk_key, comment, anchor_range, None, cx)
+    }
+
+    fn add_review_comment_at_location(
+        &mut self,
+        hunk_key: DiffHunkKey,
+        comment: String,
+        anchor_range: Range<Anchor>,
+        location: Option<ReviewCommentLocation>,
+        cx: &mut Context<Self>,
+    ) -> usize {
         let id = self.next_review_comment_id;
         self.next_review_comment_id += 1;
 
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let location = Self::review_comment_location(&hunk_key, &anchor_range, &snapshot);
+        let location = location
+            .unwrap_or_else(|| Self::review_comment_location(&hunk_key, &anchor_range, &snapshot));
         let mut stored_comment =
             StoredReviewComment::new(id, comment, anchor_range.clone(), location);
         stored_comment.anchor_text_hash =
@@ -3661,6 +3722,22 @@ impl Editor {
         false
     }
 
+    pub fn add_orphaned_review_reply(
+        &mut self,
+        comment_id: usize,
+        reply: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self
+            .orphaned_review_comments
+            .iter()
+            .any(|comment| comment.id == comment_id && comment.deleted_on.is_none())
+        {
+            return false;
+        }
+        self.add_review_reply(comment_id, reply, false, cx)
+    }
+
     pub(super) fn remove_review_comment(&mut self, id: usize, cx: &mut Context<Self>) -> bool {
         if let Some(comment) = self
             .orphaned_review_comments
@@ -4000,6 +4077,9 @@ impl Editor {
             .filter(|comment| comment.deleted_on.is_none())
             .map(|comment| OrphanedReviewCommentSummary {
                 id: comment.id,
+                author: comment.author.clone(),
+                created_at: comment.created_at.clone(),
+                review_round: comment.review_round,
                 file: comment.file.clone(),
                 line_start: comment.line_start,
                 line_end: comment.line_end,
@@ -4010,6 +4090,8 @@ impl Editor {
                     .iter()
                     .map(|reply| OrphanedReviewReplySummary {
                         author: reply.author.clone(),
+                        created_at: reply.created_at.clone(),
+                        review_round: reply.review_round,
                         body: reply.body.clone(),
                     })
                     .collect(),
@@ -4035,7 +4117,8 @@ impl Editor {
         for (key, hunk_comments) in &self.stored_review_comments {
             for comment in hunk_comments {
                 if include_deleted || comment.deleted_on.is_none() {
-                    let location = if key.hunk_start_anchor.is_valid(&snapshot)
+                    let location = if comment.location.side == "new"
+                        && key.hunk_start_anchor.is_valid(&snapshot)
                         && comment.range.start.is_valid(&snapshot)
                         && comment.range.end.is_valid(&snapshot)
                     {
@@ -4173,7 +4256,7 @@ impl Editor {
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let mut restored_count = 0;
         for mut saved_comment in restored.comments {
-            if saved_comment.side != "new" {
+            if saved_comment.side != "new" && saved_comment.side != "old" {
                 continue;
             }
             self.next_review_comment_id = self
@@ -4226,6 +4309,15 @@ impl Editor {
                     return Err("file_not_in_diff");
                 }
 
+                let location_snapshot = if saved_comment.side == "old" {
+                    snapshot
+                        .diff_for_buffer_id(buffer_snapshot.remote_id())
+                        .map(|diff| diff.base_text())
+                        .ok_or("line_not_in_diff")?
+                } else {
+                    buffer_snapshot
+                };
+
                 let start_row = saved_comment
                     .line_start
                     .checked_sub(1)
@@ -4234,18 +4326,41 @@ impl Editor {
                     .line_end
                     .checked_sub(1)
                     .ok_or("line_not_in_diff")?;
-                if start_row > buffer_snapshot.max_point().row
-                    || end_row > buffer_snapshot.max_point().row
+                if start_row > location_snapshot.max_point().row
+                    || end_row > location_snapshot.max_point().row
                 {
                     return Err("line_not_in_diff");
                 }
 
-                let line_end = Point::new(end_row, buffer_snapshot.line_len(end_row));
-                let buffer_anchor_range = buffer_snapshot.anchor_after(Point::new(start_row, 0))
-                    ..buffer_snapshot.anchor_before(line_end);
-                let anchor_range = snapshot
-                    .anchor_range_in_buffer(buffer_anchor_range)
-                    .ok_or("line_not_in_diff")?;
+                let anchor_range = if saved_comment.side == "old" {
+                    let find_deleted_row = |target_row| {
+                        snapshot
+                            .row_infos(MultiBufferRow::MIN)
+                            .find(|row| {
+                                row.buffer_id == Some(location_snapshot.remote_id())
+                                    && row.buffer_row == Some(target_row)
+                                    && row.diff_status.is_some_and(|status| status.is_deleted())
+                            })
+                            .and_then(|row| row.multibuffer_row)
+                    };
+                    let start_multibuffer_row =
+                        find_deleted_row(start_row).ok_or("line_not_in_diff")?;
+                    let end_multibuffer_row =
+                        find_deleted_row(end_row).ok_or("line_not_in_diff")?;
+                    let line_end = Point::new(
+                        end_multibuffer_row.0,
+                        snapshot.line_len(end_multibuffer_row),
+                    );
+                    snapshot.anchor_after(Point::new(start_multibuffer_row.0, 0))
+                        ..snapshot.anchor_before(line_end)
+                } else {
+                    let line_end = Point::new(end_row, buffer_snapshot.line_len(end_row));
+                    let buffer_anchor_range = buffer_snapshot.anchor_after(Point::new(start_row, 0))
+                        ..buffer_snapshot.anchor_before(line_end);
+                    snapshot
+                        .anchor_range_in_buffer(buffer_anchor_range)
+                        .ok_or("line_not_in_diff")?
+                };
 
                 Ok((
                     DiffHunkKey {
