@@ -83,6 +83,7 @@ sum_tree.workspace = true
 task.workspace = true
 telemetry.workspace = true
 text.workspace = true
+time.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
 tree-sitter-c = { workspace = true, optional = true }

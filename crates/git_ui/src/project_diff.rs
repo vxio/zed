@@ -38,9 +38,7 @@ use project::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use settings::{
-    GitDiffBaseSetting, GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore,
-};
+use settings::{GitDiffBaseSetting, GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore};
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
 use std::sync::Arc;
