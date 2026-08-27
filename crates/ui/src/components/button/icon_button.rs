@@ -53,6 +53,11 @@ impl IconButton {
         self
     }
 
+    pub fn debug_selector(mut self, selector: impl FnOnce() -> String) -> Self {
+        self.base.base = self.base.base.debug_selector(selector);
+        self
+    }
+
     /// Sets the label announced by assistive technology.
     ///
     /// Icon buttons have no visible text, so they should always set this for

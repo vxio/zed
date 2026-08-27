@@ -1144,6 +1144,7 @@ pub struct Editor {
     /// which doesn't implement Hash/Eq in a way suitable for HashMap keys.
     stored_review_comments: Vec<(DiffHunkKey, Vec<StoredReviewComment>)>,
     orphaned_review_comments: Vec<git::ReviewCommentSnapshot>,
+    orphaned_review_thread_state: git::ReviewCommentThreadState,
     diff_review_editor_cancel: Option<git::DiffReviewEditorCancel>,
     /// Counter for generating unique comment IDs.
     next_review_comment_id: usize,
@@ -2465,6 +2466,7 @@ impl Editor {
             diff_review_overlays: Vec::new(),
             stored_review_comments: Vec::new(),
             orphaned_review_comments: Vec::new(),
+            orphaned_review_thread_state: git::ReviewCommentThreadState::default(),
             diff_review_editor_cancel: None,
             next_review_comment_id: 0,
             next_review_reply_id: 0,
@@ -12088,6 +12090,7 @@ pub enum EditorEvent {
         total_count: usize,
         persist: bool,
     },
+    ReviewCommentUiChanged,
     InputIgnored {
         text: Arc<str>,
     },

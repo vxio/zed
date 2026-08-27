@@ -42137,8 +42137,9 @@ fn test_diff_review_inline_edit_cancel_keeps_comment(cx: &mut TestAppContext) {
 
             assert_eq!(editor.total_review_comment_count(), 1);
             let overlay = editor.diff_review_overlays.first().expect("review overlay");
-            assert_eq!(overlay.inline_edit_editors.len(), 1);
+            assert_eq!(overlay.thread_state.inline_edit_editors.len(), 1);
             overlay
+                .thread_state
                 .inline_edit_editors
                 .get(&0)
                 .cloned()
@@ -42160,8 +42161,8 @@ fn test_diff_review_inline_edit_cancel_keeps_comment(cx: &mut TestAppContext) {
             let comment = comments.first().expect("review comment");
             assert_eq!(comment.comment, "Original comment");
             assert!(!comment.is_editing);
-            assert!(overlay.inline_edit_editors.is_empty());
-            assert!(overlay.body_editors.is_empty());
+            assert!(overlay.thread_state.inline_edit_editors.is_empty());
+            assert!(overlay.thread_state.body_editors.is_empty());
         })
         .unwrap();
 }
@@ -42188,6 +42189,7 @@ fn test_diff_review_reply_flow_persists(cx: &mut TestAppContext) {
 
             let overlay = editor.diff_review_overlays.first().expect("review overlay");
             let reply_editor = overlay
+                .thread_state
                 .reply_editors
                 .get(&0)
                 .cloned()
@@ -42206,7 +42208,7 @@ fn test_diff_review_reply_flow_persists(cx: &mut TestAppContext) {
                 comment.replies.first().expect("reply").comment,
                 "Reply text"
             );
-            assert!(overlay.reply_editors.is_empty());
+            assert!(overlay.thread_state.reply_editors.is_empty());
 
             let value: serde_json::Value =
                 serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
@@ -42809,20 +42811,35 @@ fn test_review_comment_bodies_keep_focused_selection_bounded(cx: &mut TestAppCon
             editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
 
             let hunk_key = editor.diff_review_overlays[0].hunk_key.clone();
-            assert!(editor.diff_review_overlays[0].body_editors.is_empty());
+            assert!(
+                editor.diff_review_overlays[0]
+                    .thread_state
+                    .body_editors
+                    .is_empty()
+            );
 
             editor.toggle_review_comments_expanded_for_hunk(&hunk_key, window, cx);
             assert!(
                 !editor.diff_review_overlays[0].comments_expanded,
                 "overlay should be collapsed after toggle"
             );
-            assert!(editor.diff_review_overlays[0].body_editors.is_empty());
+            assert!(
+                editor.diff_review_overlays[0]
+                    .thread_state
+                    .body_editors
+                    .is_empty()
+            );
 
             editor.toggle_review_comments_expanded_for_hunk(&hunk_key, window, cx);
-            assert!(editor.diff_review_overlays[0].body_editors.is_empty());
+            assert!(
+                editor.diff_review_overlays[0]
+                    .thread_state
+                    .body_editors
+                    .is_empty()
+            );
 
             editor.materialize_review_comment_body_editor(
-                &hunk_key,
+                Some(&hunk_key),
                 0,
                 false,
                 "Test comment".to_string(),
@@ -42830,6 +42847,7 @@ fn test_review_comment_bodies_keep_focused_selection_bounded(cx: &mut TestAppCon
                 cx,
             );
             let body_editor = editor.diff_review_overlays[0]
+                .thread_state
                 .body_editors
                 .get(&0)
                 .expect("comment body editor")
@@ -42856,15 +42874,21 @@ fn test_review_comment_bodies_keep_focused_selection_bounded(cx: &mut TestAppCon
 
             assert!(editor.add_review_reply(0, "Test reply".to_string(), false, cx));
             editor.materialize_review_comment_body_editor(
-                &hunk_key,
+                Some(&hunk_key),
                 0,
                 true,
                 "Test reply".to_string(),
                 window,
                 cx,
             );
-            assert!(editor.diff_review_overlays[0].body_editors.contains_key(&0));
+            assert!(
+                editor.diff_review_overlays[0]
+                    .thread_state
+                    .body_editors
+                    .contains_key(&0)
+            );
             let reply_body_editor = editor.diff_review_overlays[0]
+                .thread_state
                 .reply_body_editors
                 .get(&0)
                 .expect("reply body editor");
@@ -42874,21 +42898,76 @@ fn test_review_comment_bodies_keep_focused_selection_bounded(cx: &mut TestAppCon
             let second_comment_id =
                 add_test_comment(editor, hunk_key.clone(), "Second comment", cx);
             editor.materialize_review_comment_body_editor(
-                &hunk_key,
+                Some(&hunk_key),
                 second_comment_id,
                 false,
                 "Second comment".to_string(),
                 window,
                 cx,
             );
-            assert_eq!(editor.diff_review_overlays[0].body_editors.len(), 2);
-            assert!(editor.diff_review_overlays[0].reply_body_editors.is_empty());
+            assert_eq!(
+                editor.diff_review_overlays[0]
+                    .thread_state
+                    .body_editors
+                    .len(),
+                2
+            );
+            assert!(
+                editor.diff_review_overlays[0]
+                    .thread_state
+                    .reply_body_editors
+                    .is_empty()
+            );
 
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             assert_eq!(
                 editor.comments_for_hunk(&hunk_key, &snapshot).len(),
                 2,
                 "comment data should survive collapse/expand"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_orphaned_review_comment_body_is_selectable(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.materialize_review_comment_body_editor(
+                None,
+                42,
+                false,
+                "Selectable outdated comment".to_string(),
+                window,
+                cx,
+            );
+            let body_editor = editor
+                .orphaned_review_thread_state
+                .body_editors
+                .get(&42)
+                .expect("outdated comment body editor")
+                .clone();
+            assert!(body_editor.read(cx).read_only(cx));
+            body_editor.focus_handle(cx).focus(window, cx);
+            body_editor.update(cx, |body_editor, cx| {
+                body_editor.change_selections(
+                    SelectionEffects::no_scroll(),
+                    window,
+                    cx,
+                    |selections| {
+                        selections.select_ranges([
+                            MultiBufferOffset(0)..MultiBufferOffset("Selectable".len())
+                        ])
+                    },
+                );
+                body_editor.copy(&Copy, window, cx);
+            });
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("Selectable".to_string())
             );
         })
         .unwrap();
@@ -42918,7 +42997,7 @@ fn test_review_comment_body_materializes_before_mouse_down(cx: &mut TestAppConte
     visual_cx.draw(point(px(0.), px(0.)), size(px(500.), px(100.)), |_, cx| {
         Editor::render_review_comment_body(
             "Selectable review comment body".to_string(),
-            hunk_key,
+            Some(hunk_key),
             0,
             false,
             editor_entity.downgrade(),
@@ -42929,7 +43008,12 @@ fn test_review_comment_body_materializes_before_mouse_down(cx: &mut TestAppConte
 
     editor
         .read_with(&visual_cx, |editor, _| {
-            assert!(editor.diff_review_overlays[0].body_editors.contains_key(&0));
+            assert!(
+                editor.diff_review_overlays[0]
+                    .thread_state
+                    .body_editors
+                    .contains_key(&0)
+            );
         })
         .unwrap();
 }
@@ -43199,16 +43283,20 @@ fn test_review_comment_agent_feedback_label(cx: &mut TestAppContext) {
             );
             editor.toggle_agent_feedback(&crate::actions::ToggleAgentFeedback, window, cx);
             assert_eq!(
-                editor.diff_review_overlays[0].reply_agent_feedback[&id],
+                editor.diff_review_overlays[0]
+                    .thread_state
+                    .reply_agent_feedback[&id],
                 true
             );
-            let reply_editor = editor.diff_review_overlays[0].reply_editors[&id].clone();
+            let reply_editor =
+                editor.diff_review_overlays[0].thread_state.reply_editors[&id].clone();
             reply_editor.update(cx, |reply_editor, cx| {
                 reply_editor.insert("new reply needs feedback", window, cx);
             });
             editor.submit_review_reply(id, window, cx);
             assert!(
                 !editor.diff_review_overlays[0]
+                    .thread_state
                     .reply_agent_feedback
                     .contains_key(&id),
                 "submitting must reset the pending reply flag"

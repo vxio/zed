@@ -389,6 +389,29 @@ pub struct OrphanedReviewReplySummary {
     pub body: String,
 }
 
+struct ReviewCommentView {
+    id: usize,
+    author: String,
+    created_at: Option<String>,
+    resolved_on: Option<String>,
+    body: String,
+    replies: Vec<ReviewReplyView>,
+    outdated: bool,
+    outdated_reason: Option<String>,
+    review_round: Option<u32>,
+    agent_feedback: bool,
+    show_resolved: bool,
+}
+
+struct ReviewReplyView {
+    id: usize,
+    author: String,
+    created_at: Option<String>,
+    body: String,
+    review_round: Option<u32>,
+    agent_feedback: bool,
+}
+
 #[derive(Clone)]
 pub(super) struct DiffReviewEditorCancel {
     parent: WeakEntity<Editor>,
@@ -538,6 +561,80 @@ struct ReviewReplySnapshot {
     review_round: Option<u32>,
     #[serde(default, alias = "agent_toolbox", skip_serializing_if = "is_false")]
     agent_feedback: bool,
+}
+
+impl From<StoredReviewComment> for ReviewCommentView {
+    fn from(comment: StoredReviewComment) -> Self {
+        Self {
+            id: comment.id,
+            author: comment.author,
+            created_at: comment.created_at,
+            resolved_on: comment.resolved_on,
+            body: comment.comment,
+            replies: comment
+                .replies
+                .into_iter()
+                .map(ReviewReplyView::from)
+                .collect(),
+            outdated: comment.outdated,
+            outdated_reason: comment.outdated_reason,
+            review_round: comment.review_round,
+            agent_feedback: comment.agent_feedback,
+            show_resolved: comment.show_resolved,
+        }
+    }
+}
+
+impl From<StoredReviewReply> for ReviewReplyView {
+    fn from(reply: StoredReviewReply) -> Self {
+        Self {
+            id: reply.id,
+            author: reply.author,
+            created_at: reply.created_at,
+            body: reply.comment,
+            review_round: reply.review_round,
+            agent_feedback: reply.agent_feedback,
+        }
+    }
+}
+
+impl ReviewCommentView {
+    fn from_orphaned(
+        comment: ReviewCommentSnapshot,
+        thread_state: &ReviewCommentThreadState,
+    ) -> Self {
+        let id = comment.id;
+        Self {
+            id,
+            author: comment.author,
+            created_at: comment.created_at,
+            resolved_on: comment.resolved_on,
+            body: comment.body,
+            replies: comment
+                .replies
+                .into_iter()
+                .map(ReviewReplyView::from)
+                .collect(),
+            outdated: true,
+            outdated_reason: comment.outdated_reason,
+            review_round: comment.review_round,
+            agent_feedback: comment.agent_feedback,
+            show_resolved: thread_state.shown_resolved_comments.contains(&id),
+        }
+    }
+}
+
+impl From<ReviewReplySnapshot> for ReviewReplyView {
+    fn from(reply: ReviewReplySnapshot) -> Self {
+        Self {
+            id: reply.id,
+            author: reply.author,
+            created_at: reply.created_at,
+            body: reply.body,
+            review_round: reply.review_round,
+            agent_feedback: reply.agent_feedback,
+        }
+    }
 }
 
 fn default_review_comment_author() -> String {
@@ -1544,6 +1641,47 @@ fn mention_link_for_symbol(
 }
 
 /// Represents an active diff review overlay that appears when clicking the "Add Review" button.
+#[derive(Default)]
+pub(super) struct ReviewCommentThreadState {
+    pub(super) inline_edit_editors: HashMap<usize, Entity<Editor>>,
+    pub(super) inline_edit_subscriptions: HashMap<usize, Subscription>,
+    pub(super) inline_reply_edit_editors: HashMap<usize, Entity<Editor>>,
+    pub(super) inline_reply_edit_subscriptions: HashMap<usize, Subscription>,
+    pub(super) reply_editors: HashMap<usize, Entity<Editor>>,
+    pub(super) reply_subscriptions: HashMap<usize, Subscription>,
+    pub(super) reply_agent_feedback: HashMap<usize, bool>,
+    pub(super) body_editors: HashMap<usize, Entity<Editor>>,
+    pub(super) reply_body_editors: HashMap<usize, Entity<Editor>>,
+    shown_resolved_comments: HashSet<usize>,
+}
+
+impl ReviewCommentThreadState {
+    fn remove_comment(&mut self, comment_id: usize, reply_ids: impl IntoIterator<Item = usize>) {
+        self.inline_edit_editors.remove(&comment_id);
+        self.inline_edit_subscriptions.remove(&comment_id);
+        self.reply_editors.remove(&comment_id);
+        self.reply_subscriptions.remove(&comment_id);
+        self.reply_agent_feedback.remove(&comment_id);
+        self.body_editors.remove(&comment_id);
+        self.shown_resolved_comments.remove(&comment_id);
+        for reply_id in reply_ids {
+            self.remove_reply(reply_id);
+        }
+    }
+
+    fn remove_reply(&mut self, reply_id: usize) {
+        self.inline_reply_edit_editors.remove(&reply_id);
+        self.inline_reply_edit_subscriptions.remove(&reply_id);
+        self.reply_body_editors.remove(&reply_id);
+    }
+}
+
+#[derive(Clone)]
+enum ReviewCommentThread {
+    Attached(DiffHunkKey),
+    Orphaned,
+}
+
 pub(super) struct DiffReviewOverlay {
     pub(super) anchor_range: Range<Anchor>,
     location: Option<ReviewCommentLocation>,
@@ -1554,15 +1692,7 @@ pub(super) struct DiffReviewOverlay {
     pub(super) prompt_visible: bool,
     pub(super) prompt_agent_feedback: bool,
     pub(super) confirming_discard: bool,
-    pub(super) inline_edit_editors: HashMap<usize, Entity<Editor>>,
-    pub(super) inline_edit_subscriptions: HashMap<usize, Subscription>,
-    pub(super) inline_reply_edit_editors: HashMap<usize, Entity<Editor>>,
-    pub(super) inline_reply_edit_subscriptions: HashMap<usize, Subscription>,
-    pub(super) reply_editors: HashMap<usize, Entity<Editor>>,
-    pub(super) reply_subscriptions: HashMap<usize, Subscription>,
-    pub(super) reply_agent_feedback: HashMap<usize, bool>,
-    pub(super) body_editors: HashMap<usize, Entity<Editor>>,
-    pub(super) reply_body_editors: HashMap<usize, Entity<Editor>>,
+    pub(super) thread_state: ReviewCommentThreadState,
     pub(super) user_avatar_uri: Option<SharedUri>,
     _subscription: Subscription,
 }
@@ -2491,15 +2621,7 @@ impl Editor {
             prompt_visible,
             prompt_agent_feedback: false,
             confirming_discard: false,
-            inline_edit_editors: HashMap::default(),
-            inline_edit_subscriptions: HashMap::default(),
-            inline_reply_edit_editors: HashMap::default(),
-            inline_reply_edit_subscriptions: HashMap::default(),
-            reply_editors: HashMap::default(),
-            reply_subscriptions: HashMap::default(),
-            reply_agent_feedback: HashMap::default(),
-            body_editors: HashMap::default(),
-            reply_body_editors: HashMap::default(),
+            thread_state: ReviewCommentThreadState::default(),
             user_avatar_uri,
             _subscription: subscription,
         });
@@ -2596,12 +2718,21 @@ impl Editor {
     }
 
     pub fn has_active_diff_review_input(&self) -> bool {
-        self.diff_review_overlays.iter().any(|overlay| {
-            overlay.prompt_visible
-                || !overlay.inline_edit_editors.is_empty()
-                || !overlay.inline_reply_edit_editors.is_empty()
-                || !overlay.reply_editors.is_empty()
-        })
+        !self
+            .orphaned_review_thread_state
+            .inline_edit_editors
+            .is_empty()
+            || !self
+                .orphaned_review_thread_state
+                .inline_reply_edit_editors
+                .is_empty()
+            || !self.orphaned_review_thread_state.reply_editors.is_empty()
+            || self.diff_review_overlays.iter().any(|overlay| {
+                overlay.prompt_visible
+                    || !overlay.thread_state.inline_edit_editors.is_empty()
+                    || !overlay.thread_state.inline_reply_edit_editors.is_empty()
+                    || !overlay.thread_state.reply_editors.is_empty()
+            })
     }
 
     /// Sets whether the comments section is expanded in the diff review overlay.
@@ -3361,17 +3492,18 @@ impl Editor {
         comment_id: usize,
         cx: &mut Context<Self>,
     ) {
-        let Some(hunk_key) = self.hunk_key_for_review_comment(comment_id) else {
+        let Some(thread) = self.review_comment_thread(comment_id) else {
             return;
         };
-        let snapshot = self.buffer.read(cx).snapshot(cx);
-        if let Some(overlay) = self
-            .diff_review_overlays
-            .iter_mut()
-            .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
-        {
-            let agent_feedback = overlay.reply_agent_feedback.entry(comment_id).or_default();
+        if let Some(thread_state) = self.review_comment_thread_state_mut(&thread, cx) {
+            let agent_feedback = thread_state
+                .reply_agent_feedback
+                .entry(comment_id)
+                .or_default();
             *agent_feedback = !*agent_feedback;
+            if matches!(thread, ReviewCommentThread::Orphaned) {
+                cx.emit(EditorEvent::ReviewCommentUiChanged);
+            }
             cx.notify();
         }
     }
@@ -3584,38 +3716,34 @@ impl Editor {
         };
 
         self.diff_review_overlays[overlay_index]
+            .thread_state
             .body_editors
             .clear();
         self.diff_review_overlays[overlay_index]
+            .thread_state
             .reply_body_editors
             .clear();
     }
 
     pub(super) fn materialize_review_comment_body_editor(
         &mut self,
-        hunk_key: &DiffHunkKey,
+        hunk_key: Option<&DiffHunkKey>,
         id: usize,
         is_reply: bool,
         comment: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let snapshot = self.buffer.read(cx).snapshot(cx);
-        let Some(overlay_index) = self
-            .diff_review_overlays
-            .iter()
-            .position(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, &snapshot))
-        else {
+        let thread = hunk_key.map_or(ReviewCommentThread::Orphaned, |hunk_key| {
+            ReviewCommentThread::Attached(hunk_key.clone())
+        });
+        let Some(thread_state) = self.review_comment_thread_state(&thread, cx) else {
             return;
         };
         let already_materialized = if is_reply {
-            self.diff_review_overlays[overlay_index]
-                .reply_body_editors
-                .contains_key(&id)
+            thread_state.reply_body_editors.contains_key(&id)
         } else {
-            self.diff_review_overlays[overlay_index]
-                .body_editors
-                .contains_key(&id)
+            thread_state.body_editors.contains_key(&id)
         };
         if already_materialized {
             return;
@@ -3623,20 +3751,34 @@ impl Editor {
 
         for overlay in &mut self.diff_review_overlays {
             overlay
+                .thread_state
                 .body_editors
                 .retain(|_, editor| editor.focus_handle(cx).is_focused(window));
             overlay
+                .thread_state
                 .reply_body_editors
                 .retain(|_, editor| editor.focus_handle(cx).is_focused(window));
         }
+        self.orphaned_review_thread_state
+            .body_editors
+            .retain(|_, editor| editor.focus_handle(cx).is_focused(window));
+        self.orphaned_review_thread_state
+            .reply_body_editors
+            .retain(|_, editor| editor.focus_handle(cx).is_focused(window));
         let body_editor =
             Self::review_comment_body_editor(comment, cx.entity().downgrade(), window, cx);
+        let Some(thread_state) = self.review_comment_thread_state_mut(&thread, cx) else {
+            return;
+        };
         let body_editors = if is_reply {
-            &mut self.diff_review_overlays[overlay_index].reply_body_editors
+            &mut thread_state.reply_body_editors
         } else {
-            &mut self.diff_review_overlays[overlay_index].body_editors
+            &mut thread_state.body_editors
         };
         body_editors.insert(id, body_editor);
+        if matches!(thread, ReviewCommentThread::Orphaned) {
+            cx.emit(EditorEvent::ReviewCommentUiChanged);
+        }
         cx.notify();
     }
 
@@ -3665,6 +3807,80 @@ impl Editor {
                     None
                 }
             })
+    }
+
+    fn review_comment_thread(&self, id: usize) -> Option<ReviewCommentThread> {
+        if self
+            .orphaned_review_comments
+            .iter()
+            .any(|comment| comment.id == id)
+        {
+            Some(ReviewCommentThread::Orphaned)
+        } else {
+            self.hunk_key_for_review_comment(id)
+                .map(ReviewCommentThread::Attached)
+        }
+    }
+
+    fn review_reply_thread(&self, id: usize) -> Option<ReviewCommentThread> {
+        if self
+            .orphaned_review_comments
+            .iter()
+            .any(|comment| comment.replies.iter().any(|reply| reply.id == id))
+        {
+            Some(ReviewCommentThread::Orphaned)
+        } else {
+            self.hunk_key_for_review_reply(id)
+                .map(ReviewCommentThread::Attached)
+        }
+    }
+
+    fn review_comment_thread_state(
+        &self,
+        thread: &ReviewCommentThread,
+        cx: &App,
+    ) -> Option<&ReviewCommentThreadState> {
+        match thread {
+            ReviewCommentThread::Orphaned => Some(&self.orphaned_review_thread_state),
+            ReviewCommentThread::Attached(hunk_key) => {
+                let snapshot = self.buffer.read(cx).snapshot(cx);
+                self.diff_review_overlays
+                    .iter()
+                    .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, &snapshot))
+                    .map(|overlay| &overlay.thread_state)
+            }
+        }
+    }
+
+    fn review_comment_thread_state_mut(
+        &mut self,
+        thread: &ReviewCommentThread,
+        cx: &App,
+    ) -> Option<&mut ReviewCommentThreadState> {
+        match thread {
+            ReviewCommentThread::Orphaned => Some(&mut self.orphaned_review_thread_state),
+            ReviewCommentThread::Attached(hunk_key) => {
+                let snapshot = self.buffer.read(cx).snapshot(cx);
+                self.diff_review_overlays
+                    .iter_mut()
+                    .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, &snapshot))
+                    .map(|overlay| &mut overlay.thread_state)
+            }
+        }
+    }
+
+    fn refresh_review_comment_thread(
+        &mut self,
+        thread: &ReviewCommentThread,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let ReviewCommentThread::Attached(hunk_key) = thread {
+            self.refresh_diff_review_overlay_height(hunk_key, window, cx);
+        } else {
+            cx.emit(EditorEvent::ReviewCommentUiChanged);
+        }
+        cx.notify();
     }
 
     pub(super) fn add_review_reply(
@@ -3752,7 +3968,14 @@ impl Editor {
             .iter_mut()
             .find(|comment| comment.id == id)
         {
+            let reply_ids = comment
+                .replies
+                .iter()
+                .map(|reply| reply.id)
+                .collect::<Vec<_>>();
             comment.deleted_on = current_review_comment_timestamp();
+            self.orphaned_review_thread_state
+                .remove_comment(id, reply_ids);
             cx.emit(EditorEvent::ReviewCommentsChanged {
                 total_count: self.total_review_comment_count(),
                 persist: true,
@@ -3865,6 +4088,18 @@ impl Editor {
     }
 
     pub(super) fn remove_review_reply(&mut self, id: usize, cx: &mut Context<Self>) -> bool {
+        for comment in &mut self.orphaned_review_comments {
+            if let Some(index) = comment.replies.iter().position(|reply| reply.id == id) {
+                comment.replies.remove(index);
+                self.orphaned_review_thread_state.remove_reply(id);
+                cx.emit(EditorEvent::ReviewCommentsChanged {
+                    total_count: self.total_review_comment_count(),
+                    persist: true,
+                });
+                cx.notify();
+                return true;
+            }
+        }
         for (_, comments) in self.stored_review_comments.iter_mut() {
             if let Some(replies) = comments.iter_mut().find_map(|comment| {
                 comment
@@ -3926,6 +4161,17 @@ impl Editor {
         new_comment: String,
         cx: &mut Context<Self>,
     ) -> bool {
+        for comment in &mut self.orphaned_review_comments {
+            if let Some(reply) = comment.replies.iter_mut().find(|reply| reply.id == id) {
+                reply.body = new_comment;
+                cx.emit(EditorEvent::ReviewCommentsChanged {
+                    total_count: self.total_review_comment_count(),
+                    persist: true,
+                });
+                cx.notify();
+                return true;
+            }
+        }
         for (_, comments) in self.stored_review_comments.iter_mut() {
             for comment in comments {
                 if let Some(reply) = comment.replies.iter_mut().find(|reply| reply.id == id) {
@@ -3979,10 +4225,17 @@ impl Editor {
         id: usize,
         cx: &mut Context<Self>,
     ) {
-        let Some(comment) = self.stored_review_comment_mut(id) else {
+        if let Some(comment) = self
+            .orphaned_review_comments
+            .iter_mut()
+            .find(|comment| comment.id == id)
+        {
+            comment.agent_feedback = !comment.agent_feedback;
+        } else if let Some(comment) = self.stored_review_comment_mut(id) {
+            comment.agent_feedback = !comment.agent_feedback;
+        } else {
             return;
-        };
-        comment.agent_feedback = !comment.agent_feedback;
+        }
         cx.emit(EditorEvent::ReviewCommentsChanged {
             total_count: self.total_review_comment_count(),
             persist: true,
@@ -3991,10 +4244,18 @@ impl Editor {
     }
 
     pub(super) fn toggle_agent_feedback_review_reply(&mut self, id: usize, cx: &mut Context<Self>) {
-        let Some(reply) = self.stored_review_reply_mut(id) else {
+        if let Some(reply) = self
+            .orphaned_review_comments
+            .iter_mut()
+            .flat_map(|comment| &mut comment.replies)
+            .find(|reply| reply.id == id)
+        {
+            reply.agent_feedback = !reply.agent_feedback;
+        } else if let Some(reply) = self.stored_review_reply_mut(id) {
+            reply.agent_feedback = !reply.agent_feedback;
+        } else {
             return;
-        };
-        reply.agent_feedback = !reply.agent_feedback;
+        }
         cx.emit(EditorEvent::ReviewCommentsChanged {
             total_count: self.total_review_comment_count(),
             persist: true,
@@ -4015,17 +4276,33 @@ impl Editor {
             cx.notify();
             return;
         }
-        if let Some(comment_id) = self.diff_review_overlays.iter().find_map(|overlay| {
-            overlay
-                .reply_editors
-                .iter()
-                .find_map(|(comment_id, editor)| {
-                    editor
-                        .focus_handle(cx)
-                        .is_focused(window)
-                        .then_some(*comment_id)
-                })
-        }) {
+        if let Some(comment_id) = self
+            .diff_review_overlays
+            .iter()
+            .find_map(|overlay| {
+                overlay
+                    .thread_state
+                    .reply_editors
+                    .iter()
+                    .find_map(|(comment_id, editor)| {
+                        editor
+                            .focus_handle(cx)
+                            .is_focused(window)
+                            .then_some(*comment_id)
+                    })
+            })
+            .or_else(|| {
+                self.orphaned_review_thread_state
+                    .reply_editors
+                    .iter()
+                    .find_map(|(comment_id, editor)| {
+                        editor
+                            .focus_handle(cx)
+                            .is_focused(window)
+                            .then_some(*comment_id)
+                    })
+            })
+        {
             self.toggle_reply_prompt_agent_feedback(comment_id, cx);
             return;
         }
@@ -4250,6 +4527,7 @@ impl Editor {
         self.dismiss_all_diff_review_overlays(cx);
         self.stored_review_comments.clear();
         self.orphaned_review_comments.clear();
+        self.orphaned_review_thread_state = ReviewCommentThreadState::default();
         self.next_review_comment_id = 0;
         self.next_review_reply_id = 0;
 
@@ -4494,6 +4772,7 @@ impl Editor {
         self.dismiss_all_diff_review_overlays(cx);
         self.stored_review_comments.clear();
         self.orphaned_review_comments.clear();
+        self.orphaned_review_thread_state = ReviewCommentThreadState::default();
         self.next_review_comment_id = 0;
         self.next_review_reply_id = 0;
         cx.emit(EditorEvent::ReviewCommentsChanged {
@@ -4592,102 +4871,92 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let comment_id = action.id;
-
+        let Some(thread) = self.review_comment_thread(comment_id) else {
+            return;
+        };
+        if self
+            .review_comment_thread_state(&thread, cx)
+            .is_some_and(|state| state.inline_edit_editors.contains_key(&comment_id))
+        {
+            return;
+        }
         self.set_comment_editing(comment_id, true, cx);
-
-        let hunk_key = self.hunk_key_for_review_comment(comment_id);
+        let comment_text = self
+            .orphaned_review_comments
+            .iter()
+            .find(|comment| comment.id == comment_id)
+            .map(|comment| comment.body.clone())
+            .or_else(|| {
+                self.stored_review_comments
+                    .iter()
+                    .flat_map(|(_, comments)| comments)
+                    .find(|comment| comment.id == comment_id)
+                    .map(|comment| comment.comment.clone())
+            })
+            .unwrap_or_default();
         let completion_project = self.project.as_ref().map(Entity::downgrade);
-
-        let snapshot = self.buffer.read(cx).snapshot(cx);
-        if let Some(hunk_key) = hunk_key {
-            if let Some(overlay) = self
-                .diff_review_overlays
-                .iter_mut()
-                .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
-            {
-                if let std::collections::hash_map::Entry::Vacant(entry) =
-                    overlay.inline_edit_editors.entry(comment_id)
-                {
-                    let comment_text = self
-                        .stored_review_comments
-                        .iter()
-                        .flat_map(|(_, comments)| comments)
-                        .find(|c| c.id == comment_id)
-                        .map(|c| c.comment.clone())
-                        .unwrap_or_default();
-
-                    let parent_editor = cx.entity().downgrade();
-                    let inline_editor = cx.new(|cx| {
-                        let mut editor = Self::review_comment_input_editor(window, cx);
-                        editor.set_text(&*comment_text, window, cx);
-                        editor.move_to_end(&crate::actions::MoveToEnd, window, cx);
-                        editor.diff_review_editor_cancel = Some(DiffReviewEditorCancel::edit(
-                            parent_editor.clone(),
-                            comment_id,
-                        ));
-                        editor
+        let parent_editor = cx.entity().downgrade();
+        let inline_editor = cx.new(|cx| {
+            let mut editor = Self::review_comment_input_editor(window, cx);
+            editor.set_text(&*comment_text, window, cx);
+            editor.move_to_end(&crate::actions::MoveToEnd, window, cx);
+            editor.diff_review_editor_cancel = Some(DiffReviewEditorCancel::edit(
+                parent_editor.clone(),
+                comment_id,
+            ));
+            editor
+        });
+        Self::attach_review_comment_completion_provider(completion_project, &inline_editor, cx);
+        let insert_mode_subscription =
+            Self::install_review_comment_insert_mode_handler(&inline_editor, window, cx);
+        let enter_subscription = Self::review_comment_enter_subscription(&inline_editor, cx, {
+            let parent_editor = parent_editor.clone();
+            move |window, cx| {
+                if let Some(editor) = parent_editor.upgrade() {
+                    editor.update(cx, |editor, cx| {
+                        editor.confirm_edit_review_comment(comment_id, window, cx);
                     });
-                    Self::attach_review_comment_completion_provider(
-                        completion_project.clone(),
-                        &inline_editor,
-                        cx,
-                    );
-                    let insert_mode_subscription = Self::install_review_comment_insert_mode_handler(
-                        &inline_editor,
-                        window,
-                        cx,
-                    );
-
-                    let enter_subscription =
-                        Self::review_comment_enter_subscription(&inline_editor, cx, {
-                            let parent_editor = parent_editor.clone();
-                            move |window, cx| {
-                                if let Some(editor) = parent_editor.upgrade() {
-                                    editor.update(cx, |editor, cx| {
-                                        editor.confirm_edit_review_comment(comment_id, window, cx);
-                                    });
-                                }
-                            }
-                        });
-                    let subscription = inline_editor.update(cx, |inline_editor, _cx| {
-                        let confirm_subscription = inline_editor.register_action({
-                            let parent_editor = parent_editor.clone();
-                            move |_: &menu::Confirm, window, cx| {
-                                if let Some(editor) = parent_editor.upgrade() {
-                                    editor.update(cx, |editor, cx| {
-                                        editor.confirm_edit_review_comment(comment_id, window, cx);
-                                    });
-                                }
-                            }
-                        });
-                        let cancel_subscription = inline_editor.register_action({
-                            let parent_editor = parent_editor.clone();
-                            move |_: &crate::actions::Cancel, window, cx| {
-                                if let Some(editor) = parent_editor.upgrade() {
-                                    editor.update(cx, |editor, cx| {
-                                        editor.cancel_edit_review_comment(comment_id, window, cx);
-                                    });
-                                }
-                            }
-                        });
-                        Subscription::join(
-                            Subscription::join(confirm_subscription, cancel_subscription),
-                            Subscription::join(enter_subscription, insert_mode_subscription),
-                        )
-                    });
-
-                    overlay
-                        .inline_edit_subscriptions
-                        .insert(comment_id, subscription);
-
-                    Self::focus_review_comment_editor(&inline_editor, window, cx);
-
-                    entry.insert(inline_editor);
                 }
             }
-        }
+        });
+        let subscription = inline_editor.update(cx, |inline_editor, _cx| {
+            let confirm_subscription = inline_editor.register_action({
+                let parent_editor = parent_editor.clone();
+                move |_: &menu::Confirm, window, cx| {
+                    if let Some(editor) = parent_editor.upgrade() {
+                        editor.update(cx, |editor, cx| {
+                            editor.confirm_edit_review_comment(comment_id, window, cx);
+                        });
+                    }
+                }
+            });
+            let cancel_subscription = inline_editor.register_action({
+                let parent_editor = parent_editor.clone();
+                move |_: &crate::actions::Cancel, window, cx| {
+                    if let Some(editor) = parent_editor.upgrade() {
+                        editor.update(cx, |editor, cx| {
+                            editor.cancel_edit_review_comment(comment_id, window, cx);
+                        });
+                    }
+                }
+            });
+            Subscription::join(
+                Subscription::join(confirm_subscription, cancel_subscription),
+                Subscription::join(enter_subscription, insert_mode_subscription),
+            )
+        });
 
-        cx.notify();
+        let Some(thread_state) = self.review_comment_thread_state_mut(&thread, cx) else {
+            return;
+        };
+        thread_state
+            .inline_edit_subscriptions
+            .insert(comment_id, subscription);
+        thread_state
+            .inline_edit_editors
+            .insert(comment_id, inline_editor.clone());
+        Self::focus_review_comment_editor(&inline_editor, window, cx);
+        self.refresh_review_comment_thread(&thread, window, cx);
     }
 
     pub(super) fn reply_to_review_comment(
@@ -4697,22 +4966,17 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let comment_id = action.id;
-        let Some(hunk_key) = self.hunk_key_for_review_comment(comment_id) else {
+        let Some(thread) = self.review_comment_thread(comment_id) else {
             return;
         };
 
         let completion_project = self.project.as_ref().map(Entity::downgrade);
-        let snapshot = self.buffer.read(cx).snapshot(cx);
-        let Some(overlay) = self
-            .diff_review_overlays
-            .iter_mut()
-            .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
-        else {
+        let Some(thread_state) = self.review_comment_thread_state_mut(&thread, cx) else {
             return;
         };
 
         if let std::collections::hash_map::Entry::Vacant(entry) =
-            overlay.reply_editors.entry(comment_id)
+            thread_state.reply_editors.entry(comment_id)
         {
             let parent_editor = cx.entity().downgrade();
             let reply_editor = cx.new(|cx| {
@@ -4765,13 +5029,14 @@ impl Editor {
                 )
             });
 
-            overlay.reply_subscriptions.insert(comment_id, subscription);
+            thread_state
+                .reply_subscriptions
+                .insert(comment_id, subscription);
             Self::focus_review_comment_editor(&reply_editor, window, cx);
             entry.insert(reply_editor);
         }
 
-        self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
-        cx.notify();
+        self.refresh_review_comment_thread(&thread, window, cx);
     }
 
     pub(super) fn submit_review_reply(
@@ -4780,21 +5045,16 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(hunk_key) = self.hunk_key_for_review_comment(comment_id) else {
+        let Some(thread) = self.review_comment_thread(comment_id) else {
             return;
         };
-        let snapshot = self.buffer.read(cx).snapshot(cx);
         let reply_text = self
-            .diff_review_overlays
-            .iter()
-            .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
-            .and_then(|overlay| overlay.reply_editors.get(&comment_id))
+            .review_comment_thread_state(&thread, cx)
+            .and_then(|state| state.reply_editors.get(&comment_id))
             .map(|editor| editor.read(cx).text(cx).trim().to_string());
         let agent_feedback = self
-            .diff_review_overlays
-            .iter()
-            .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
-            .and_then(|overlay| overlay.reply_agent_feedback.get(&comment_id))
+            .review_comment_thread_state(&thread, cx)
+            .and_then(|state| state.reply_agent_feedback.get(&comment_id))
             .copied()
             .unwrap_or(false);
 
@@ -4813,22 +5073,16 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(hunk_key) = self.hunk_key_for_review_comment(comment_id) else {
+        let Some(thread) = self.review_comment_thread(comment_id) else {
             return;
         };
-        let snapshot = self.buffer.read(cx).snapshot(cx);
-        if let Some(overlay) = self
-            .diff_review_overlays
-            .iter_mut()
-            .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
-        {
-            overlay.reply_editors.remove(&comment_id);
-            overlay.reply_subscriptions.remove(&comment_id);
-            overlay.reply_agent_feedback.remove(&comment_id);
+        if let Some(thread_state) = self.review_comment_thread_state_mut(&thread, cx) {
+            thread_state.reply_editors.remove(&comment_id);
+            thread_state.reply_subscriptions.remove(&comment_id);
+            thread_state.reply_agent_feedback.remove(&comment_id);
         }
 
-        self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
-        cx.notify();
+        self.refresh_review_comment_thread(&thread, window, cx);
     }
 
     pub(super) fn cancel_active_diff_review_editor(
@@ -4839,7 +5093,21 @@ impl Editor {
         let inline_comment_id = self
             .diff_review_overlays
             .iter()
-            .find_map(|overlay| overlay.inline_edit_editors.keys().next().copied());
+            .find_map(|overlay| {
+                overlay
+                    .thread_state
+                    .inline_edit_editors
+                    .keys()
+                    .next()
+                    .copied()
+            })
+            .or_else(|| {
+                self.orphaned_review_thread_state
+                    .inline_edit_editors
+                    .keys()
+                    .next()
+                    .copied()
+            });
         if let Some(comment_id) = inline_comment_id {
             self.cancel_edit_review_comment(comment_id, window, cx);
             return true;
@@ -4848,7 +5116,21 @@ impl Editor {
         let inline_reply_id = self
             .diff_review_overlays
             .iter()
-            .find_map(|overlay| overlay.inline_reply_edit_editors.keys().next().copied());
+            .find_map(|overlay| {
+                overlay
+                    .thread_state
+                    .inline_reply_edit_editors
+                    .keys()
+                    .next()
+                    .copied()
+            })
+            .or_else(|| {
+                self.orphaned_review_thread_state
+                    .inline_reply_edit_editors
+                    .keys()
+                    .next()
+                    .copied()
+            });
         if let Some(reply_id) = inline_reply_id {
             self.cancel_edit_review_reply(reply_id, window, cx);
             return true;
@@ -4857,7 +5139,14 @@ impl Editor {
         let reply_comment_id = self
             .diff_review_overlays
             .iter()
-            .find_map(|overlay| overlay.reply_editors.keys().next().copied());
+            .find_map(|overlay| overlay.thread_state.reply_editors.keys().next().copied())
+            .or_else(|| {
+                self.orphaned_review_thread_state
+                    .reply_editors
+                    .keys()
+                    .next()
+                    .copied()
+            });
         if let Some(comment_id) = reply_comment_id {
             self.cancel_review_reply(comment_id, window, cx);
             return true;
@@ -4873,18 +5162,12 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let snapshot = self.buffer.read(cx).snapshot(cx);
-        let hunk_key = self.hunk_key_for_review_comment(comment_id);
-
-        let new_text = hunk_key
-            .as_ref()
-            .and_then(|hunk_key| {
-                self.diff_review_overlays
-                    .iter()
-                    .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, &snapshot))
-            })
-            .as_ref()
-            .and_then(|overlay| overlay.inline_edit_editors.get(&comment_id))
+        let Some(thread) = self.review_comment_thread(comment_id) else {
+            return;
+        };
+        let new_text = self
+            .review_comment_thread_state(&thread, cx)
+            .and_then(|state| state.inline_edit_editors.get(&comment_id))
             .map(|editor| editor.read(cx).text(cx).trim().to_string());
 
         if let Some(new_text) = new_text {
@@ -4893,19 +5176,13 @@ impl Editor {
             }
         }
 
-        if let Some(hunk_key) = hunk_key {
-            if let Some(overlay) = self
-                .diff_review_overlays
-                .iter_mut()
-                .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
-            {
-                overlay.inline_edit_editors.remove(&comment_id);
-                overlay.inline_edit_subscriptions.remove(&comment_id);
-            }
-            self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        if let Some(thread_state) = self.review_comment_thread_state_mut(&thread, cx) {
+            thread_state.inline_edit_editors.remove(&comment_id);
+            thread_state.inline_edit_subscriptions.remove(&comment_id);
         }
 
         self.set_comment_editing(comment_id, false, cx);
+        self.refresh_review_comment_thread(&thread, window, cx);
     }
 
     /// Cancels an inline edit of a review comment.
@@ -4915,21 +5192,15 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let hunk_key = self.hunk_key_for_review_comment(comment_id);
+        let Some(thread) = self.review_comment_thread(comment_id) else {
+            return;
+        };
         self.set_comment_editing(comment_id, false, cx);
-
-        if let Some(hunk_key) = hunk_key {
-            let snapshot = self.buffer.read(cx).snapshot(cx);
-            if let Some(overlay) = self
-                .diff_review_overlays
-                .iter_mut()
-                .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
-            {
-                overlay.inline_edit_editors.remove(&comment_id);
-                overlay.inline_edit_subscriptions.remove(&comment_id);
-            }
-            self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        if let Some(thread_state) = self.review_comment_thread_state_mut(&thread, cx) {
+            thread_state.inline_edit_editors.remove(&comment_id);
+            thread_state.inline_edit_subscriptions.remove(&comment_id);
         }
+        self.refresh_review_comment_thread(&thread, window, cx);
     }
 
     pub(super) fn confirm_edit_review_reply(
@@ -4938,18 +5209,12 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let snapshot = self.buffer.read(cx).snapshot(cx);
-        let hunk_key = self.hunk_key_for_review_reply(reply_id);
-
-        let new_text = hunk_key
-            .as_ref()
-            .and_then(|hunk_key| {
-                self.diff_review_overlays
-                    .iter()
-                    .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, &snapshot))
-            })
-            .as_ref()
-            .and_then(|overlay| overlay.inline_reply_edit_editors.get(&reply_id))
+        let Some(thread) = self.review_reply_thread(reply_id) else {
+            return;
+        };
+        let new_text = self
+            .review_comment_thread_state(&thread, cx)
+            .and_then(|state| state.inline_reply_edit_editors.get(&reply_id))
             .map(|editor| editor.read(cx).text(cx).trim().to_string());
 
         if let Some(new_text) = new_text {
@@ -4958,19 +5223,15 @@ impl Editor {
             }
         }
 
-        if let Some(hunk_key) = hunk_key {
-            if let Some(overlay) = self
-                .diff_review_overlays
-                .iter_mut()
-                .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
-            {
-                overlay.inline_reply_edit_editors.remove(&reply_id);
-                overlay.inline_reply_edit_subscriptions.remove(&reply_id);
-            }
-            self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        if let Some(thread_state) = self.review_comment_thread_state_mut(&thread, cx) {
+            thread_state.inline_reply_edit_editors.remove(&reply_id);
+            thread_state
+                .inline_reply_edit_subscriptions
+                .remove(&reply_id);
         }
 
         self.set_reply_editing(reply_id, false, cx);
+        self.refresh_review_comment_thread(&thread, window, cx);
     }
 
     pub(super) fn cancel_edit_review_reply(
@@ -4979,21 +5240,17 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let hunk_key = self.hunk_key_for_review_reply(reply_id);
+        let Some(thread) = self.review_reply_thread(reply_id) else {
+            return;
+        };
         self.set_reply_editing(reply_id, false, cx);
-
-        if let Some(hunk_key) = hunk_key {
-            let snapshot = self.buffer.read(cx).snapshot(cx);
-            if let Some(overlay) = self
-                .diff_review_overlays
-                .iter_mut()
-                .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
-            {
-                overlay.inline_reply_edit_editors.remove(&reply_id);
-                overlay.inline_reply_edit_subscriptions.remove(&reply_id);
-            }
-            self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        if let Some(thread_state) = self.review_comment_thread_state_mut(&thread, cx) {
+            thread_state.inline_reply_edit_editors.remove(&reply_id);
+            thread_state
+                .inline_reply_edit_subscriptions
+                .remove(&reply_id);
         }
+        self.refresh_review_comment_thread(&thread, window, cx);
     }
 
     /// Action handler for ConfirmEditReviewComment.
@@ -5103,6 +5360,9 @@ impl Editor {
             .find(|comment| comment.id == id)
         {
             comment.resolved_on = timestamp;
+            self.orphaned_review_thread_state
+                .shown_resolved_comments
+                .remove(&id);
         } else if let Some(comment) = self
             .stored_review_comments
             .iter_mut()
@@ -5129,10 +5389,10 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let hunk_key = self.hunk_key_for_review_comment(action.id);
+        let thread = self.review_comment_thread(action.id);
         self.set_review_comment_resolved(action.id, true, cx);
-        if let Some(hunk_key) = hunk_key {
-            self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        if let Some(thread) = thread {
+            self.refresh_review_comment_thread(&thread, window, cx);
         }
     }
 
@@ -5142,10 +5402,10 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let hunk_key = self.hunk_key_for_review_comment(action.id);
+        let thread = self.review_comment_thread(action.id);
         self.set_review_comment_resolved(action.id, false, cx);
-        if let Some(hunk_key) = hunk_key {
-            self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        if let Some(thread) = thread {
+            self.refresh_review_comment_thread(&thread, window, cx);
         }
     }
 
@@ -5155,6 +5415,24 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .orphaned_review_comments
+            .iter()
+            .any(|comment| comment.id == action.id && comment.resolved_on.is_some())
+        {
+            if !self
+                .orphaned_review_thread_state
+                .shown_resolved_comments
+                .remove(&action.id)
+            {
+                self.orphaned_review_thread_state
+                    .shown_resolved_comments
+                    .insert(action.id);
+            }
+            cx.emit(EditorEvent::ReviewCommentUiChanged);
+            cx.notify();
+            return;
+        }
         let hunk_key = self.hunk_key_for_review_comment(action.id);
         if let Some(comment) = self
             .stored_review_comments
@@ -5213,99 +5491,97 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(thread) = self.review_reply_thread(reply_id) else {
+            return;
+        };
         self.set_reply_editing(reply_id, true, cx);
 
-        let hunk_key = self.hunk_key_for_review_reply(reply_id);
         let reply_text = self
-            .stored_review_comments
+            .orphaned_review_comments
             .iter()
-            .flat_map(|(_, comments)| comments)
             .flat_map(|comment| &comment.replies)
             .find(|reply| reply.id == reply_id)
-            .map(|reply| reply.comment.clone())
+            .map(|reply| reply.body.clone())
+            .or_else(|| {
+                self.stored_review_comments
+                    .iter()
+                    .flat_map(|(_, comments)| comments)
+                    .flat_map(|comment| &comment.replies)
+                    .find(|reply| reply.id == reply_id)
+                    .map(|reply| reply.comment.clone())
+            })
             .unwrap_or_default();
 
         let completion_project = self.project.as_ref().map(Entity::downgrade);
-        let snapshot = self.buffer.read(cx).snapshot(cx);
-        if let Some(hunk_key) = hunk_key {
-            if let Some(overlay) = self
-                .diff_review_overlays
-                .iter_mut()
-                .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
+        if let Some(thread_state) = self.review_comment_thread_state_mut(&thread, cx) {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                thread_state.inline_reply_edit_editors.entry(reply_id)
             {
-                if let std::collections::hash_map::Entry::Vacant(entry) =
-                    overlay.inline_reply_edit_editors.entry(reply_id)
-                {
-                    let parent_editor = cx.entity().downgrade();
-                    let inline_editor = cx.new(|cx| {
-                        let mut editor = Self::review_comment_input_editor(window, cx);
-                        editor.set_text(&*reply_text, window, cx);
-                        editor.select_all(&crate::actions::SelectAll, window, cx);
-                        editor.diff_review_editor_cancel = Some(
-                            DiffReviewEditorCancel::reply_edit(parent_editor.clone(), reply_id),
-                        );
-                        editor
-                    });
-                    Self::attach_review_comment_completion_provider(
-                        completion_project.clone(),
-                        &inline_editor,
-                        cx,
-                    );
-                    let insert_mode_subscription = Self::install_review_comment_insert_mode_handler(
-                        &inline_editor,
-                        window,
-                        cx,
-                    );
+                let parent_editor = cx.entity().downgrade();
+                let inline_editor = cx.new(|cx| {
+                    let mut editor = Self::review_comment_input_editor(window, cx);
+                    editor.set_text(&*reply_text, window, cx);
+                    editor.select_all(&crate::actions::SelectAll, window, cx);
+                    editor.diff_review_editor_cancel = Some(DiffReviewEditorCancel::reply_edit(
+                        parent_editor.clone(),
+                        reply_id,
+                    ));
+                    editor
+                });
+                Self::attach_review_comment_completion_provider(
+                    completion_project,
+                    &inline_editor,
+                    cx,
+                );
+                let insert_mode_subscription =
+                    Self::install_review_comment_insert_mode_handler(&inline_editor, window, cx);
 
-                    let enter_subscription =
-                        Self::review_comment_enter_subscription(&inline_editor, cx, {
-                            let parent_editor = parent_editor.clone();
-                            move |window, cx| {
-                                if let Some(editor) = parent_editor.upgrade() {
-                                    editor.update(cx, |editor, cx| {
-                                        editor.confirm_edit_review_reply(reply_id, window, cx);
-                                    });
-                                }
+                let enter_subscription =
+                    Self::review_comment_enter_subscription(&inline_editor, cx, {
+                        let parent_editor = parent_editor.clone();
+                        move |window, cx| {
+                            if let Some(editor) = parent_editor.upgrade() {
+                                editor.update(cx, |editor, cx| {
+                                    editor.confirm_edit_review_reply(reply_id, window, cx);
+                                });
                             }
-                        });
-                    let subscription = inline_editor.update(cx, |inline_editor, _cx| {
-                        let confirm_subscription = inline_editor.register_action({
-                            let parent_editor = parent_editor.clone();
-                            move |_: &menu::Confirm, window, cx| {
-                                if let Some(editor) = parent_editor.upgrade() {
-                                    editor.update(cx, |editor, cx| {
-                                        editor.confirm_edit_review_reply(reply_id, window, cx);
-                                    });
-                                }
-                            }
-                        });
-                        let cancel_subscription = inline_editor.register_action({
-                            let parent_editor = parent_editor.clone();
-                            move |_: &crate::actions::Cancel, window, cx| {
-                                if let Some(editor) = parent_editor.upgrade() {
-                                    editor.update(cx, |editor, cx| {
-                                        editor.cancel_edit_review_reply(reply_id, window, cx);
-                                    });
-                                }
-                            }
-                        });
-                        Subscription::join(
-                            Subscription::join(confirm_subscription, cancel_subscription),
-                            Subscription::join(enter_subscription, insert_mode_subscription),
-                        )
+                        }
                     });
+                let subscription = inline_editor.update(cx, |inline_editor, _cx| {
+                    let confirm_subscription = inline_editor.register_action({
+                        let parent_editor = parent_editor.clone();
+                        move |_: &menu::Confirm, window, cx| {
+                            if let Some(editor) = parent_editor.upgrade() {
+                                editor.update(cx, |editor, cx| {
+                                    editor.confirm_edit_review_reply(reply_id, window, cx);
+                                });
+                            }
+                        }
+                    });
+                    let cancel_subscription = inline_editor.register_action({
+                        let parent_editor = parent_editor.clone();
+                        move |_: &crate::actions::Cancel, window, cx| {
+                            if let Some(editor) = parent_editor.upgrade() {
+                                editor.update(cx, |editor, cx| {
+                                    editor.cancel_edit_review_reply(reply_id, window, cx);
+                                });
+                            }
+                        }
+                    });
+                    Subscription::join(
+                        Subscription::join(confirm_subscription, cancel_subscription),
+                        Subscription::join(enter_subscription, insert_mode_subscription),
+                    )
+                });
 
-                    overlay
-                        .inline_reply_edit_subscriptions
-                        .insert(reply_id, subscription);
-                    Self::focus_review_comment_editor(&inline_editor, window, cx);
-                    entry.insert(inline_editor);
-                }
+                thread_state
+                    .inline_reply_edit_subscriptions
+                    .insert(reply_id, subscription);
+                Self::focus_review_comment_editor(&inline_editor, window, cx);
+                entry.insert(inline_editor);
             }
-
-            self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
-            cx.notify();
         }
+        self.refresh_review_comment_thread(&thread, window, cx);
     }
 
     pub(super) fn copy_permalink_to_line(
@@ -5787,7 +6063,9 @@ impl Editor {
                 .iter()
                 .map(|comment| {
                     overlay
-                        .and_then(|overlay| overlay.inline_edit_editors.get(&comment.id))
+                        .and_then(|overlay| {
+                            overlay.thread_state.inline_edit_editors.get(&comment.id)
+                        })
                         .map(|editor| editor_height(editor, cx))
                         .unwrap_or_else(|| text_height(&comment.comment))
                         + comment
@@ -5796,7 +6074,10 @@ impl Editor {
                             .map(|reply| {
                                 overlay
                                     .and_then(|overlay| {
-                                        overlay.inline_reply_edit_editors.get(&reply.id)
+                                        overlay
+                                            .thread_state
+                                            .inline_reply_edit_editors
+                                            .get(&reply.id)
                                     })
                                     .map(|editor| editor_height(editor, cx))
                                     .unwrap_or_else(|| text_height(&reply.comment))
@@ -5807,6 +6088,7 @@ impl Editor {
             let reply_editor_height = overlay
                 .map(|overlay| {
                     overlay
+                        .thread_state
                         .reply_editors
                         .values()
                         .map(|editor| editor_height(editor, cx))
@@ -6322,12 +6604,12 @@ impl Editor {
                             o.comments_expanded,
                             o.prompt_visible,
                             o.prompt_agent_feedback,
-                            o.inline_edit_editors.clone(),
-                            o.inline_reply_edit_editors.clone(),
-                            o.reply_editors.clone(),
-                            o.reply_agent_feedback.clone(),
-                            o.body_editors.clone(),
-                            o.reply_body_editors.clone(),
+                            o.thread_state.inline_edit_editors.clone(),
+                            o.thread_state.inline_reply_edit_editors.clone(),
+                            o.thread_state.reply_editors.clone(),
+                            o.thread_state.reply_agent_feedback.clone(),
+                            o.thread_state.body_editors.clone(),
+                            o.thread_state.reply_body_editors.clone(),
                             o.user_avatar_uri.clone(),
                             if ranges.is_empty() {
                                 None
@@ -6559,6 +6841,52 @@ impl Editor {
             .into_any_element()
     }
 
+    pub fn render_orphaned_review_comment_thread(
+        editor_handle: WeakEntity<Editor>,
+        comment_id: usize,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let editor = editor_handle.upgrade()?;
+        let editor = editor.read(cx);
+        let comment = editor
+            .orphaned_review_comments
+            .iter()
+            .find(|comment| comment.id == comment_id && comment.deleted_on.is_none())?
+            .clone();
+        let thread_state = &editor.orphaned_review_thread_state;
+        let comment = ReviewCommentView::from_orphaned(comment, thread_state);
+        let inline_editor = thread_state.inline_edit_editors.get(&comment_id).cloned();
+        let reply_editor = thread_state.reply_editors.get(&comment_id).cloned();
+        let reply_agent_feedback = thread_state
+            .reply_agent_feedback
+            .get(&comment_id)
+            .copied()
+            .unwrap_or(false);
+
+        Some(Self::render_comment_row(
+            comment,
+            None,
+            inline_editor,
+            thread_state.inline_reply_edit_editors.clone(),
+            reply_editor,
+            reply_agent_feedback,
+            thread_state.body_editors.get(&comment_id).cloned(),
+            thread_state.reply_body_editors.clone(),
+            None,
+            editor_handle,
+            px(20.),
+            IconSize::Custom(rems(20. / 16.)),
+            cx.theme().colors(),
+        ))
+    }
+
+    pub fn drop_orphaned_review_comment_body_editors(&mut self, cx: &mut Context<Self>) {
+        self.orphaned_review_thread_state.body_editors.clear();
+        self.orphaned_review_thread_state.reply_body_editors.clear();
+        cx.emit(EditorEvent::ReviewCommentUiChanged);
+        cx.notify();
+    }
+
     fn render_comments_section(
         comments: Vec<StoredReviewComment>,
         hunk_key: DiffHunkKey,
@@ -6644,8 +6972,8 @@ impl Editor {
                     let body_editor = body_editors.get(&comment.id).cloned();
                     let reply_body_editors = reply_body_editors.clone();
                     Self::render_comment_row(
-                        comment,
-                        hunk_key.clone(),
+                        comment.into(),
+                        Some(hunk_key.clone()),
                         inline_editor,
                         inline_reply_editors,
                         reply_editor,
@@ -6663,8 +6991,8 @@ impl Editor {
     }
 
     fn render_comment_row(
-        comment: StoredReviewComment,
-        hunk_key: DiffHunkKey,
+        comment: ReviewCommentView,
+        hunk_key: Option<DiffHunkKey>,
         inline_editor: Option<Entity<Editor>>,
         inline_reply_editors: HashMap<usize, Entity<Editor>>,
         reply_editor: Option<Entity<Editor>>,
@@ -6708,12 +7036,7 @@ impl Editor {
         let review_comment_border = colors.border_variant;
 
         if is_resolved && !show_resolved && !is_editing {
-            let collapsed_preview = comment
-                .comment
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .to_string();
+            let collapsed_preview = comment.body.lines().next().unwrap_or_default().to_string();
             return v_flex()
                 .w_full()
                 .min_w_0()
@@ -6737,12 +7060,12 @@ impl Editor {
                                 .gap_1()
                                 .child(Self::render_author_badge(
                                     author,
-                                    user_avatar_uri.clone(),
+                                    user_avatar_uri,
                                     avatar_size,
                                     colors,
                                 ))
                                 .child(Self::render_resolved_badge(colors))
-                                .when_some(created_at.clone(), |el, created_at| {
+                                .when_some(created_at, |el, created_at| {
                                     el.child(Self::render_review_timestamp(created_at))
                                 })
                                 .when(reply_count > 0, |el| {
@@ -6860,7 +7183,7 @@ impl Editor {
                             .when_some(review_round, |el, round| {
                                 el.child(Self::render_review_round_badge(round, colors))
                             })
-                            .when_some(created_at.clone(), |el, created_at| {
+                            .when_some(created_at, |el, created_at| {
                                 el.child(Self::render_review_timestamp(created_at))
                             })
                             .when(is_resolved, |el| {
@@ -6894,6 +7217,9 @@ impl Editor {
                                     format!("diff-review-copy-reference-{comment_id}"),
                                     IconName::Copy,
                                 )
+                                .debug_selector(move || {
+                                    format!("diff-review-copy-reference-{comment_id}")
+                                })
                                 .icon_color(ui::Color::Info)
                                 .icon_size(action_icon_size)
                                 .size(ButtonSize::None)
@@ -6913,6 +7239,9 @@ impl Editor {
                                     format!("diff-review-agent-feedback-{comment_id}"),
                                     IconName::ToolHammer,
                                 )
+                                .debug_selector(move || {
+                                    format!("diff-review-agent-feedback-{comment_id}")
+                                })
                                 .icon_color(if agent_feedback {
                                     ui::Color::Accent
                                 } else {
@@ -6941,6 +7270,7 @@ impl Editor {
                                     format!("diff-review-reply-{comment_id}"),
                                     IconName::ReplyArrowRight,
                                 )
+                                .debug_selector(move || format!("diff-review-reply-{comment_id}"))
                                 .icon_color(ui::Color::Default)
                                 .icon_size(action_icon_size)
                                 .size(ButtonSize::None)
@@ -6964,6 +7294,7 @@ impl Editor {
                                     format!("diff-review-edit-{comment_id}"),
                                     IconName::Pencil,
                                 )
+                                .debug_selector(move || format!("diff-review-edit-{comment_id}"))
                                 .icon_color(ui::Color::Modified)
                                 .icon_size(action_icon_size)
                                 .size(ButtonSize::None)
@@ -6987,6 +7318,7 @@ impl Editor {
                                     format!("diff-review-delete-{comment_id}"),
                                     IconName::Trash,
                                 )
+                                .debug_selector(move || format!("diff-review-delete-{comment_id}"))
                                 .icon_color(ui::Color::Error)
                                 .icon_size(action_icon_size)
                                 .size(ButtonSize::None)
@@ -7009,6 +7341,9 @@ impl Editor {
                                         format!("diff-review-resolve-{comment_id}"),
                                         IconName::Check,
                                     )
+                                    .debug_selector(move || {
+                                        format!("diff-review-resolve-{comment_id}")
+                                    })
                                     .icon_color(ui::Color::Success)
                                     .icon_size(action_icon_size)
                                     .size(ButtonSize::None)
@@ -7104,7 +7439,7 @@ impl Editor {
                                 body_editor.into_any_element()
                             } else {
                                 Self::render_review_comment_body(
-                                    comment.comment,
+                                    comment.body,
                                     hunk_key.clone(),
                                     comment_id,
                                     false,
@@ -7249,7 +7584,7 @@ impl Editor {
                             .when_some(reply_review_round, |el, round| {
                                 el.child(Self::render_review_round_badge(round, colors))
                             })
-                            .when_some(reply_created_at.clone(), |el, created_at| {
+                            .when_some(reply_created_at, |el, created_at| {
                                 el.child(Self::render_review_timestamp(created_at))
                             })
                             .child(div().mx_1p5().w_px().h_4().bg(review_comment_border))
@@ -7258,6 +7593,9 @@ impl Editor {
                                     format!("diff-review-copy-reply-reference-{reply_id}"),
                                     IconName::Copy,
                                 )
+                                .debug_selector(move || {
+                                    format!("diff-review-copy-reply-reference-{reply_id}")
+                                })
                                 .icon_color(ui::Color::Info)
                                 .icon_size(action_icon_size)
                                 .size(ButtonSize::None)
@@ -7276,6 +7614,9 @@ impl Editor {
                                     format!("diff-review-agent-feedback-reply-{reply_id}"),
                                     IconName::ToolHammer,
                                 )
+                                .debug_selector(move || {
+                                    format!("diff-review-agent-feedback-reply-{reply_id}")
+                                })
                                 .icon_color(if reply_agent_feedback {
                                     ui::Color::Accent
                                 } else {
@@ -7302,6 +7643,9 @@ impl Editor {
                                     format!("diff-review-reply-to-reply-{reply_id}"),
                                     IconName::ReplyArrowRight,
                                 )
+                                .debug_selector(move || {
+                                    format!("diff-review-reply-to-reply-{reply_id}")
+                                })
                                 .icon_color(ui::Color::Default)
                                 .icon_size(action_icon_size)
                                 .size(ButtonSize::None)
@@ -7325,6 +7669,9 @@ impl Editor {
                                     format!("diff-review-edit-reply-{reply_id}"),
                                     IconName::Pencil,
                                 )
+                                .debug_selector(move || {
+                                    format!("diff-review-edit-reply-{reply_id}")
+                                })
                                 .icon_color(ui::Color::Modified)
                                 .icon_size(action_icon_size)
                                 .size(ButtonSize::None)
@@ -7342,6 +7689,9 @@ impl Editor {
                                     format!("diff-review-delete-reply-{reply_id}"),
                                     IconName::Trash,
                                 )
+                                .debug_selector(move || {
+                                    format!("diff-review-delete-reply-{reply_id}")
+                                })
                                 .icon_color(ui::Color::Error)
                                 .icon_size(action_icon_size)
                                 .size(ButtonSize::None)
@@ -7378,7 +7728,7 @@ impl Editor {
                                 reply_body_editor.into_any_element()
                             } else {
                                 Self::render_review_comment_body(
-                                    reply.comment,
+                                    reply.body,
                                     hunk_key.clone(),
                                     reply_id,
                                     true,
@@ -7566,6 +7916,9 @@ impl Editor {
                                         format!("diff-review-submit-reply-{comment_id}"),
                                         IconName::Return,
                                     )
+                                    .debug_selector(move || {
+                                        format!("diff-review-submit-reply-{comment_id}")
+                                    })
                                     .icon_color(ui::Color::Muted)
                                     .icon_size(action_icon_size)
                                     .size(ButtonSize::Medium)
@@ -7592,7 +7945,7 @@ impl Editor {
 
     pub(super) fn render_review_comment_body(
         comment: String,
-        hunk_key: DiffHunkKey,
+        hunk_key: Option<DiffHunkKey>,
         id: usize,
         is_reply: bool,
         editor_handle: WeakEntity<Editor>,
@@ -7621,7 +7974,12 @@ impl Editor {
                     window.defer(cx, move |window, cx| {
                         editor.update(cx, |editor, cx| {
                             editor.materialize_review_comment_body_editor(
-                                &hunk_key, id, is_reply, comment, window, cx,
+                                hunk_key.as_ref(),
+                                id,
+                                is_reply,
+                                comment,
+                                window,
+                                cx,
                             );
                         });
                     });
@@ -7972,6 +8330,7 @@ impl Editor {
         self.dismiss_all_diff_review_overlays(cx);
         let comments = std::mem::take(&mut self.stored_review_comments);
         self.orphaned_review_comments.clear();
+        self.orphaned_review_thread_state = ReviewCommentThreadState::default();
         self.next_review_comment_id = 0;
         self.next_review_reply_id = 0;
         cx.emit(EditorEvent::ReviewCommentsChanged {
