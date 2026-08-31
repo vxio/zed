@@ -188,6 +188,10 @@ Rules emerge from validated patterns, not one-off observations. The workflow is:
 2. Team validates the pattern in code review.
 3. A dedicated commit adds the rule with context on *why* it exists.
 
+# Diff Review Comment Identity
+
+When persisting or restoring diff-review comments, identify files by their exact repository-relative `file.path()`. `PathKey.path` can be synthetic in sorted multi-buffers, so use it only for buffers without a backing file and never remap comments by filename similarity. If a saved path is missing or ambiguous, preserve the comment as outdated or orphaned instead of attaching it to another file.
+
 # Zed Fork Sync
 
 When asked to update or sync this fork with upstream Zed and the worktree has local changes, always commit the local changes first, then run the fork sync workflow. Do not stash or discard the changes unless Vince explicitly asks for that instead.
