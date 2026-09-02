@@ -6268,7 +6268,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_review_comment_add_persists_and_restores(cx: &mut TestAppContext) {
+    async fn test_review_comment_stays_attached_after_file_edit(cx: &mut TestAppContext) {
         init_review_db_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -6332,6 +6332,34 @@ mod tests {
         });
         let restored = editor.read_with(cx, |editor, cx| editor.review_comments_json(cx).unwrap());
         assert!(restored.contains("new comment"));
+        let restored: serde_json::Value = serde_json::from_str(&restored).unwrap();
+        assert_eq!(restored["comments"][0]["side"], "new");
+        assert_ne!(restored["comments"][0]["outdated"], true);
+
+        fs.insert_file(path!("/project/foo.txt"), b"FOOBAR\n".to_vec())
+            .await;
+        cx.run_until_parked();
+
+        let after_edit =
+            editor.read_with(cx, |editor, cx| editor.review_comments_json(cx).unwrap());
+        let after_edit: serde_json::Value = serde_json::from_str(&after_edit).unwrap();
+        assert_eq!(after_edit["comments"][0]["body"], "new comment");
+        assert_ne!(after_edit["comments"][0]["outdated"], true);
+        editor.read_with(cx, |editor, _| {
+            assert!(editor.orphaned_review_comment_summaries().is_empty());
+        });
+
+        fs.insert_file(path!("/project/foo.txt"), Vec::new()).await;
+        cx.run_until_parked();
+
+        let after_removal =
+            editor.read_with(cx, |editor, cx| editor.review_comments_json(cx).unwrap());
+        let after_removal: serde_json::Value = serde_json::from_str(&after_removal).unwrap();
+        assert_eq!(after_removal["comments"][0]["outdated"], true);
+        assert_eq!(
+            after_removal["comments"][0]["outdated_reason"],
+            "line_not_in_diff"
+        );
     }
 
     #[gpui::test]

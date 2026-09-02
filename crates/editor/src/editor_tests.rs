@@ -42418,11 +42418,11 @@ fn test_diff_review_overlay_rejects_ranges_across_buffers(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-fn test_review_comment_becomes_outdated_when_commented_text_changes(cx: &mut TestAppContext) {
+fn test_review_comment_stays_attached_when_commented_text_changes(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
     let editor = cx.add_window(|window, cx| {
-        let buffer = cx.new(|cx| Buffer::local("line 1\nline 2\nline 3\n", cx));
+        let buffer = cx.new(|cx| Buffer::local("line 1\nchanged line\nline 3\n", cx));
         let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
         Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
     });
@@ -42436,41 +42436,49 @@ fn test_review_comment_becomes_outdated_when_commented_text_changes(cx: &mut Tes
                 file_path: Arc::from(util::rel_path::RelPath::empty()),
                 hunk_start_anchor: start,
             };
-            editor.add_review_comment(key, "Comment on line 2".to_string(), start..end, cx);
+            editor.add_review_comment(key, "Comment on changed line".to_string(), start..end, cx);
             let original_json = editor.review_comments_json(cx).unwrap();
 
             editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
-                selections.select_ranges([Point::new(1, 0)..Point::new(1, 6)])
+                selections.select_ranges([Point::new(1, 0)..Point::new(1, 7)])
             });
-            editor.insert("unrelated replacement", window, cx);
-            assert!(editor.refresh_review_comment_outdated_markers(cx));
+            editor.insert("updated", window, cx);
+            assert!(!editor.refresh_review_comment_outdated_markers(cx));
 
             let comments: serde_json::Value =
                 serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
             assert_eq!(comments["comments"][0]["line_start"], 2);
             assert_eq!(comments["comments"][0]["line_end"], 2);
-            assert_eq!(comments["comments"][0]["outdated"], true);
-            assert_eq!(comments["comments"][0]["outdated_reason"], "line_changed");
-            assert!(editor.stored_review_comments.is_empty());
-            assert_eq!(editor.orphaned_review_comment_summaries().len(), 1);
+            assert_ne!(comments["comments"][0]["outdated"], true);
+            assert_eq!(editor.stored_review_comments.len(), 1);
+            assert!(editor.orphaned_review_comment_summaries().is_empty());
 
             assert_eq!(
                 editor
                     .restore_review_comments_json(&original_json, window, cx)
                     .unwrap(),
-                0
+                1
             );
             let restored: serde_json::Value =
                 serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
             assert_eq!(restored["comments"][0]["line_start"], 2);
-            assert_eq!(restored["comments"][0]["outdated_reason"], "line_changed");
-            assert!(editor.stored_review_comments.is_empty());
+            assert_ne!(restored["comments"][0]["outdated"], true);
+            assert_eq!(editor.stored_review_comments.len(), 1);
+            assert!(editor.orphaned_review_comment_summaries().is_empty());
+
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(1, 0)..Point::new(1, 8)])
+            });
+            editor.insert("", window, cx);
+            assert!(!editor.refresh_review_comment_outdated_markers(cx));
+            assert_eq!(editor.stored_review_comments.len(), 1);
+            assert!(editor.orphaned_review_comment_summaries().is_empty());
         })
         .unwrap();
 }
 
 #[gpui::test]
-fn test_orphaned_review_comment_preserves_stored_location(cx: &mut TestAppContext) {
+fn test_review_comment_stays_attached_when_surrounding_lines_change(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
     let editor = cx.add_window(|window, cx| {
@@ -42494,13 +42502,15 @@ fn test_orphaned_review_comment_preserves_stored_location(cx: &mut TestAppContex
                 selections.select_ranges([Point::new(0, 0)..Point::new(0, 0)])
             });
             editor.insert("inserted line\n", window, cx);
-            assert!(editor.refresh_review_comment_outdated_markers(cx));
+            assert!(!editor.refresh_review_comment_outdated_markers(cx));
 
             let comments: serde_json::Value =
                 serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
-            assert_eq!(comments["comments"][0]["line_start"], 2);
-            assert_eq!(comments["comments"][0]["line_end"], 2);
-            assert_eq!(comments["comments"][0]["outdated"], true);
+            assert_eq!(comments["comments"][0]["line_start"], 3);
+            assert_eq!(comments["comments"][0]["line_end"], 3);
+            assert_ne!(comments["comments"][0]["outdated"], true);
+            assert_eq!(editor.stored_review_comments.len(), 1);
+            assert!(editor.orphaned_review_comment_summaries().is_empty());
         })
         .unwrap();
 }
@@ -42510,7 +42520,7 @@ fn test_review_comment_marked_outdated_after_line_removed(cx: &mut TestAppContex
     init_test(cx, |_| {});
 
     let editor = cx.add_window(|window, cx| {
-        let buffer = cx.new(|cx| Buffer::local("line 1\nline 2\nline 3\n", cx));
+        let buffer = cx.new(|cx| Buffer::local("line 1\nchanged line\nline 3\n", cx));
         let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
         Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
     });
@@ -42518,25 +42528,28 @@ fn test_review_comment_marked_outdated_after_line_removed(cx: &mut TestAppContex
     editor
         .update(cx, |editor, _window, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
-            let anchor = snapshot.anchor_after(Point::new(1, 0));
+            let start = snapshot.anchor_before(Point::new(1, 0));
+            let end = snapshot.anchor_after(Point::new(1, snapshot.line_len(MultiBufferRow(1))));
             let key = DiffHunkKey {
                 file_path: Arc::from(util::rel_path::RelPath::empty()),
-                hunk_start_anchor: anchor,
+                hunk_start_anchor: start,
             };
-            editor.add_review_comment(key, "Comment on line 2".to_string(), anchor..anchor, cx);
+            editor.add_review_comment(key, "Comment on changed line".to_string(), start..end, cx);
             editor.add_review_reply(0, "Reply to outdated comment".to_string(), false, cx);
         })
         .unwrap();
 
     editor
         .update(cx, |editor, window, cx| {
-            editor.select_all(&SelectAll, window, cx);
-            editor.insert("line 1\nline 3\n", window, cx);
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(1, 0)..Point::new(2, 0)])
+            });
+            editor.insert("", window, cx);
             assert!(editor.refresh_review_comment_outdated_markers(cx));
 
             let comments: serde_json::Value =
                 serde_json::from_str(&editor.review_comments_json(cx).unwrap()).unwrap();
-            assert_eq!(comments["comments"][0]["body"], "Comment on line 2");
+            assert_eq!(comments["comments"][0]["body"], "Comment on changed line");
             assert_eq!(comments["comments"][0]["outdated"], true);
             assert_eq!(
                 comments["comments"][0]["outdated_reason"],

@@ -351,6 +351,9 @@ pub(super) struct StoredReviewComment {
     pub(super) review_round: Option<u32>,
     pub(super) agent_feedback: bool,
     anchor_text_hash: Option<String>,
+    // Buffer edit history distinguishes an in-place rewrite from removal of the reviewed range.
+    anchor_text_version: Option<clock::Global>,
+    anchor_text_length: usize,
     /// Runtime-only: expands a resolved thread in place without unresolving it.
     pub(super) show_resolved: bool,
     location: ReviewCommentLocation,
@@ -1749,6 +1752,8 @@ impl StoredReviewComment {
             review_round: None,
             agent_feedback: false,
             anchor_text_hash: None,
+            anchor_text_version: None,
+            anchor_text_length: 0,
             show_resolved: false,
             location,
         }
@@ -2835,14 +2840,21 @@ impl Editor {
             return Some("file_not_in_diff".to_string());
         }
 
+        if comment.location.side == "new"
+            && let Some(anchor_text_was_removed) =
+                Self::review_comment_anchor_text_was_removed(comment, snapshot)
+        {
+            return anchor_text_was_removed.then(|| "line_not_in_diff".to_string());
+        }
+
         if !comment.range.start.is_valid(snapshot) || !comment.range.end.is_valid(snapshot) {
             return Some("line_not_in_diff".to_string());
         }
 
-        if let Some(anchor_text_hash) = comment.anchor_text_hash.as_deref()
-            && Self::review_comment_anchor_text_hash(&comment.range, snapshot).as_deref()
-                != Some(anchor_text_hash)
-        {
+        let anchor_text_changed = comment.anchor_text_hash.as_deref().is_some_and(|hash| {
+            Self::review_comment_anchor_text_hash(&comment.range, snapshot).as_deref() != Some(hash)
+        });
+        if anchor_text_changed {
             return Some("line_changed".to_string());
         }
 
@@ -2868,10 +2880,59 @@ impl Editor {
         (!has_hunk).then(|| "line_not_in_diff".to_string())
     }
 
+    fn review_comment_anchor_text_was_removed(
+        comment: &StoredReviewComment,
+        snapshot: &MultiBufferSnapshot,
+    ) -> Option<bool> {
+        let Some(anchor_text_version) = comment.anchor_text_version.as_ref() else {
+            return None;
+        };
+        if comment.anchor_text_length == 0 {
+            return None;
+        }
+        let (Some(start), Some(end)) = (
+            comment.range.start.raw_text_anchor(),
+            comment.range.end.raw_text_anchor(),
+        ) else {
+            return None;
+        };
+        if start.buffer_id != end.buffer_id {
+            return None;
+        }
+        let Some((buffer_snapshot, _)) = snapshot
+            .buffers_with_paths()
+            .find(|(buffer_snapshot, _)| buffer_snapshot.remote_id() == start.buffer_id)
+        else {
+            return None;
+        };
+
+        let edit_range = start.bias_left(buffer_snapshot)..end.bias_right(buffer_snapshot);
+        let removed_length = buffer_snapshot
+            .edits_since_in_range::<usize>(anchor_text_version, edit_range)
+            .map(|edit| edit.old_len())
+            .sum::<usize>();
+        let inserted_length = buffer_snapshot
+            .anchored_edits_since::<usize>(anchor_text_version)
+            .filter(|(_, edit_range)| {
+                edit_range.end.cmp(&start, buffer_snapshot).is_gt()
+                    && edit_range.start.cmp(&end, buffer_snapshot).is_lt()
+            })
+            .map(|(edit, _)| edit.new_len())
+            .sum::<usize>();
+        Some(inserted_length == 0 && removed_length >= comment.anchor_text_length)
+    }
+
     fn review_comment_anchor_text_hash(
         range: &Range<Anchor>,
         snapshot: &MultiBufferSnapshot,
     ) -> Option<String> {
+        Self::review_comment_anchor_text_metadata(range, snapshot).map(|metadata| metadata.0)
+    }
+
+    fn review_comment_anchor_text_metadata(
+        range: &Range<Anchor>,
+        snapshot: &MultiBufferSnapshot,
+    ) -> Option<(String, clock::Global, usize)> {
         if !range.start.is_valid(snapshot) || !range.end.is_valid(snapshot) {
             return None;
         }
@@ -2889,7 +2950,11 @@ impl Editor {
         let text = buffer_snapshot
             .text_for_range(buffer_range)
             .collect::<String>();
-        Some(format!("{:x}", Sha256::digest(text.as_bytes())))
+        Some((
+            format!("{:x}", Sha256::digest(text.as_bytes())),
+            buffer_snapshot.version().clone(),
+            text.len(),
+        ))
     }
 
     #[cfg(test)]
@@ -2919,8 +2984,15 @@ impl Editor {
             .unwrap_or_else(|| Self::review_comment_location(&hunk_key, &anchor_range, &snapshot));
         let mut stored_comment =
             StoredReviewComment::new(id, comment, anchor_range.clone(), location);
-        stored_comment.anchor_text_hash =
-            Self::review_comment_anchor_text_hash(&anchor_range, &snapshot);
+        if let Some((hash, version, text_length)) =
+            Self::review_comment_anchor_text_metadata(&anchor_range, &snapshot)
+        {
+            stored_comment.anchor_text_hash = Some(hash);
+            if stored_comment.location.side == "new" {
+                stored_comment.anchor_text_version = Some(version);
+                stored_comment.anchor_text_length = text_length;
+            }
+        }
         let key_point = hunk_key.hunk_start_anchor.to_point(&snapshot);
 
         if let Some((_, comments)) = self.stored_review_comments.iter_mut().find(|(k, _)| {
@@ -4662,12 +4734,28 @@ impl Editor {
                 }
             };
 
-            if let Some(anchor_text_hash) = saved_comment.anchor_text_hash.as_deref()
-                && Self::review_comment_anchor_text_hash(&anchor_range, &snapshot).as_deref()
-                    != Some(anchor_text_hash)
+            let anchor_text_changed =
+                saved_comment
+                    .anchor_text_hash
+                    .as_deref()
+                    .is_some_and(|hash| {
+                        Self::review_comment_anchor_text_hash(&anchor_range, &snapshot).as_deref()
+                            != Some(hash)
+                    });
+            let anchor_range_is_empty =
+                anchor_range.start.to_point(&snapshot) == anchor_range.end.to_point(&snapshot);
+            if anchor_text_changed
+                && (saved_comment.side == "old" || saved_comment.outdated || anchor_range_is_empty)
             {
                 saved_comment.outdated = true;
-                saved_comment.outdated_reason = Some("line_changed".to_string());
+                saved_comment.outdated_reason.get_or_insert_with(|| {
+                    if saved_comment.side == "new" && anchor_range_is_empty {
+                        "line_not_in_diff"
+                    } else {
+                        "line_changed"
+                    }
+                    .to_string()
+                });
                 self.orphaned_review_comments.push(saved_comment);
                 continue;
             }
@@ -4705,6 +4793,16 @@ impl Editor {
                 replies,
                 location,
             );
+            let anchor_text_metadata =
+                Self::review_comment_anchor_text_metadata(&anchor_range, &snapshot);
+            let tracks_anchor_text = comment.location.side == "new";
+            let (anchor_text_version, anchor_text_length) = if tracks_anchor_text {
+                anchor_text_metadata
+                    .map(|(_, version, text_length)| (Some(version), text_length))
+                    .unwrap_or((None, 0))
+            } else {
+                (None, 0)
+            };
             let comment = StoredReviewComment {
                 created_at: saved_comment.created_at,
                 deleted_on: saved_comment.deleted_on,
@@ -4714,6 +4812,8 @@ impl Editor {
                 review_round: saved_comment.review_round,
                 agent_feedback: saved_comment.agent_feedback,
                 anchor_text_hash: saved_comment.anchor_text_hash,
+                anchor_text_version,
+                anchor_text_length,
                 ..comment
             };
 
